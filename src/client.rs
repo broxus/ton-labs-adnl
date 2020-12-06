@@ -145,20 +145,27 @@ impl AdnlClient {
         stream: &mut AdnlStream,
         config: &AdnlClientConfig,
     ) -> Result<AdnlStreamCrypto> {
-        let mut rng = rand::thread_rng();
-        let mut buf: Vec<u8> = (0..160).map(|_| rng.gen()).collect();
+        let mut buf: Vec<u8> = {
+            let mut rng = rand::thread_rng();
+            let mut buf: Vec<u8> = (0..160).map(|_| rng.gen()).collect();
+            if let Some(client_key) = &config.client_key {
+                AdnlHandshake::build_packet(&mut buf, client_key, &config.server_key)?
+            } else {
+                AdnlHandshake::build_packet(
+                    &mut buf,
+                    &KeyOption::from_ed25519_secret_key(ed25519_dalek::SecretKey::generate(
+                        &mut rng,
+                    )),
+                    &config.server_key,
+                )?
+            }
+            buf
+        };
+
         let nonce = arrayref::array_ref!(buf, 0, 160);
         dump!(trace, TARGET, "Nonce", nonce);
         let ret = AdnlStreamCrypto::with_nonce_as_client(nonce);
-        if let Some(client_key) = &config.client_key {
-            AdnlHandshake::build_packet(&mut buf, client_key, &config.server_key)?
-        } else {
-            AdnlHandshake::build_packet(
-                &mut buf,
-                &KeyOption::from_ed25519_secret_key(ed25519_dalek::SecretKey::generate(&mut rng)),
-                &config.server_key,
-            )?
-        }
+
         stream.write(&mut buf).await?;
         Ok(ret)
     }
