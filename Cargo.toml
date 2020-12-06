@@ -27,7 +27,7 @@ tokio = { version = "0.2.5", features = ["rt-threaded", "stream", "tcp", "udp"] 
 tokio-io-timeout = "0.4.0"
 x25519-dalek = "0.6.0"
 
-ton_api = { git = "https://github.com/tonlabs/ton-labs-tl.git", package = "ton_api" }
+ton_api = { git = "https://github.com/broxus/ton-labs-tl.git", branch = "original", package = "ton_api" }
 ton_types = { git = "https://github.com/tonlabs/ton-labs-types.git" }
 lockfree = { git = "https://github.com/tonlabs/lockfree.git" }
 
