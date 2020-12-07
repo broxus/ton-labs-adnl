@@ -298,7 +298,7 @@ impl AdnlChannel {
             AdnlCryptoUtils::calc_shared_secret(channel_pvt_key.pvt_key()?, channel_pub_key);
         let cmp = local_key.cmp(other_key);
         let (fwd_secret, rev_secret) = if Ordering::Equal == cmp {
-            (fwd_secret, fwd_secret.clone())
+            (fwd_secret, fwd_secret)
         } else {
             let rev_secret = [
                 fwd_secret[31],
@@ -359,7 +359,7 @@ impl AdnlChannel {
 
     fn calc_id(secret: &[u8; 32]) -> Result<ChannelId> {
         let object = AesKey {
-            key: ton::int256(secret.clone()),
+            key: ton::int256(*secret),
         };
         hash(object)
     }
@@ -638,7 +638,7 @@ impl IpAddress {
     }
 
     /// Convert to UDP data
-    pub fn into_udp(&self) -> Udp {
+    pub fn export_udp_data(&self) -> Udp {
         Udp {
             ip: self.ip() as i32,
             port: self.port() as i32,
@@ -648,18 +648,22 @@ impl IpAddress {
     fn from_ip_and_port(ip: u32, port: u16) -> Self {
         Self(((ip as u64) << 16) | port as u64)
     }
+
     fn ip(&self) -> u32 {
         let Self(ref ip) = self;
         (*ip >> 16) as u32
     }
+
     fn port(&self) -> u16 {
         let Self(ref ip) = self;
         *ip as u16
     }
+
     fn set_ip(&mut self, new_ip: u32) {
         let Self(ref mut ip) = self;
         *ip = ((new_ip as u64) << 16) | (*ip & 0xFFFF)
     }
+
     fn set_port(&mut self, new_port: u16) {
         let Self(ref mut ip) = self;
         *ip = (*ip & 0xFFFFFFFF0000u64) | new_port as u64
@@ -733,6 +737,12 @@ pub struct PeerHistory {
     seqno: AtomicU64,
 }
 
+impl Default for PeerHistory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PeerHistory {
     const INDEX_MASK: u8 = 0xFF;
     const IN_TRANSIT: u64 = 0xFFFFFFFFFFFFFFFF;
@@ -800,15 +810,14 @@ impl PeerHistory {
             // Masks format:
             // lower0, lower1, lower2, lower3, upper0, upper1, upper2, upper3
             let mask = 1 << (seqno_masked % 64);
-            let mask_offset = if index_normalized > seqno_normalized {
+            let mask_offset = match index_normalized {
                 // Lower part of the window
-                Some(0)
-            } else if index_normalized == seqno_normalized {
+                index if index > seqno_normalized => Some(0),
                 // Upper part of the window
-                Some(4)
-            } else {
-                None
+                index if index == seqno_normalized => Some(4),
+                _ => None,
             };
+
             let next_index = if let Some(mask_offset) = mask_offset {
                 let mask_offset = mask_offset + seqno_masked as usize / 64;
                 let already_received =
@@ -1282,10 +1291,8 @@ impl AdnlNode {
                 if let Err(e) = Self::send(&mut sender, job).await {
                     log::warn!(target: TARGET, "ERROR --> {}", e);
                 }
-                if node_send.stop.load(atomic::Ordering::Relaxed) > 0 {
-                    if stop {
-                        break;
-                    }
+                if node_send.stop.load(atomic::Ordering::Relaxed) > 0 && stop {
+                    break;
                 }
             }
             node_send.stop.fetch_add(1, atomic::Ordering::Relaxed);
@@ -1414,7 +1421,7 @@ impl AdnlNode {
     pub fn build_address_list(&self, expire_at: Option<i32>) -> Result<AddressList> {
         let version = Version::get();
         let ret = AddressList {
-            addrs: vec![self.config.ip_address.into_udp().into_boxed()].into(),
+            addrs: vec![self.config.ip_address.export_udp_data().into_boxed()].into(),
             version,
             reinit_date: self.start_time,
             priority: 0,
@@ -1751,7 +1758,7 @@ impl AdnlNode {
                 )
             }
         } else {
-            local_pub.replace(local_pub_key.clone());
+            local_pub.replace(*local_pub_key);
         }
         let channel = AdnlChannel::with_keys(local_key, local_pvt_key, other_key, other_pub)?;
         log::debug!(
@@ -1787,14 +1794,14 @@ impl AdnlNode {
 
     async fn process(
         &self,
-        subscribers: &Vec<Arc<dyn Subscriber>>,
+        subscribers: &[Arc<dyn Subscriber>],
         msg: &AdnlMessage,
         peers: &AdnlPeers,
         #[cfg(feature = "trace")] data: Vec<u8>,
     ) -> Result<()> {
         let new_msg = if let AdnlMessage::Adnl_Message_Part(part) = msg {
             let transfer_id = get256(&part.hash);
-            let added = add_object_to_map(&self.transfers, transfer_id.clone(), || {
+            let added = add_object_to_map(&self.transfers, *transfer_id, || {
                 let transfer = Transfer {
                     data: lockfree::map::Map::new(),
                     received: AtomicUsize::new(0),
@@ -1807,7 +1814,7 @@ impl AdnlNode {
                 if added {
                     let transfers_wait = self.transfers.clone();
                     let transfer_wait = transfer.val().clone();
-                    let transfer_id_wait = transfer_id.clone();
+                    let transfer_id_wait = *transfer_id;
                     tokio::spawn(async move {
                         loop {
                             tokio::time::delay_for(Duration::from_millis(
@@ -1856,8 +1863,8 @@ impl AdnlNode {
             AdnlMessage::Adnl_Message_Answer(answer) => {
                 #[cfg(feature = "trace")]
                 {
-                    let query_id = get256(&answer.query_id).clone();
-                    if !add_object_to_map(&self.answers, query_id.clone(), || Ok(data.clone()))? {
+                    let query_id = *get256(&answer.query_id);
+                    if !add_object_to_map(&self.answers, query_id, || Ok(data.clone()))? {
                         fail!(
                             "INTERNAL ERROR: duplicated answer ({}) {:?} {:?} {:?}",
                             answer.answer.0.len(),
@@ -1871,7 +1878,7 @@ impl AdnlNode {
                 None
             }
             AdnlMessage::Adnl_Message_ConfirmChannel(confirm) => {
-                let mut local_pub = Some(get256(&confirm.peer_key).clone());
+                let mut local_pub = Some(*get256(&confirm.peer_key));
                 let channel = self.create_channel(
                     peers,
                     &mut local_pub,
@@ -1880,8 +1887,7 @@ impl AdnlNode {
                 )?;
                 self.channels_send
                     .insert(peers.other().clone(), channel.clone());
-                self.channels_recv
-                    .insert(channel.recv_id().clone(), channel);
+                self.channels_recv.insert(*channel.recv_id(), channel);
                 None
             }
             AdnlMessage::Adnl_Message_CreateChannel(create) => {
@@ -1902,8 +1908,7 @@ impl AdnlNode {
                     .insert(peers.other().clone(), channel.clone())
                     .or_else(|| self.channels_send.remove(peers.other()))
                     .and_then(|removed| self.channels_recv.remove(removed.val().recv_id()));
-                self.channels_recv
-                    .insert(channel.recv_id().clone(), channel);
+                self.channels_recv.insert(*channel.recv_id(), channel);
                 Some(msg)
             }
             AdnlMessage::Adnl_Message_Custom(custom) => {
@@ -1924,7 +1929,7 @@ impl AdnlNode {
     }
 
     async fn process_answer(&self, answer: &AdnlAnswerMessage, src: &Arc<KeyId>) -> Result<()> {
-        let query_id = get256(&answer.query_id).clone();
+        let query_id = *get256(&answer.query_id);
         if !Self::update_query(&self.queries, query_id, Some(&answer.answer)).await? {
             fail!("Received answer from {} to unknown query {:?}", src, answer)
         }
@@ -1932,7 +1937,7 @@ impl AdnlNode {
     }
 
     async fn process_query(
-        subscribers: &Vec<Arc<dyn Subscriber>>,
+        subscribers: &[Arc<dyn Subscriber>],
         query: &AdnlQueryMessage,
         peers: &AdnlPeers,
     ) -> Result<Option<AdnlMessage>> {
@@ -1943,11 +1948,7 @@ impl AdnlNode {
         }
     }
 
-    async fn receive(
-        &self,
-        buf: &mut Vec<u8>,
-        subscribers: &Vec<Arc<dyn Subscriber>>,
-    ) -> Result<()> {
+    async fn receive(&self, buf: &mut Vec<u8>, subscribers: &[Arc<dyn Subscriber>]) -> Result<()> {
         #[cfg(feature = "trace")]
         let trace_buf = buf.clone();
         let (local_key, other_key) =
@@ -2036,7 +2037,7 @@ impl AdnlNode {
             log::debug!(target: TARGET, "Create channel {} -> {}", src.id(), dst);
             Some(
                 CreateChannel {
-                    key: ton::int256(peer.address.channel_key.pub_key()?.clone()),
+                    key: ton::int256(*peer.address.channel_key.pub_key()?),
                     date: Version::get(),
                 }
                 .into_boxed(),
@@ -2081,7 +2082,7 @@ impl AdnlNode {
                 let mut part = Vec::new();
                 part.extend_from_slice(&data[offset..next]);
                 let part = AdnlPartMessage {
-                    hash: ton::int256(arrayref::array_ref!(hash.as_slice(), 0, 32).clone()),
+                    hash: ton::int256(*arrayref::array_ref!(hash.as_slice(), 0, 32)),
                     total_size: data.len() as i32,
                     offset: offset as i32,
                     data: ton::bytes(part),
@@ -2108,13 +2109,13 @@ impl AdnlNode {
                 from: if channel.is_some() {
                     None
                 } else {
-                    Some(source.into_tl_public_key()?)
+                    Some(source.export_tl_public_key()?)
                 },
                 from_short: if channel.is_some() {
                     None
                 } else {
                     Some(AdnlIdShort {
-                        id: ton::int256(source.id().data().clone()),
+                        id: ton::int256(*source.id().data()),
                     })
                 },
                 message,

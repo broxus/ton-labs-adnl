@@ -53,7 +53,7 @@ impl AdnlServerConfig {
                 for key in list.iter() {
                     let key = KeyOption::from_public_key(key)?;
                     let key = key.pub_key()?;
-                    if clients.insert(key.clone(), 0).is_some() {
+                    if clients.insert(*key, 0).is_some() {
                         fail!(
                             "Duplicated client key {} in server config",
                             base64::encode(key)

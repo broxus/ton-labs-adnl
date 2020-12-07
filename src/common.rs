@@ -544,7 +544,7 @@ impl KeyOption {
     pub fn from_type_and_public_key(type_id: i32, pub_key: &[u8; 32]) -> Self {
         Self {
             id: Self::calc_id(type_id, pub_key),
-            keys: [Some(pub_key.clone()), None, None],
+            keys: [Some(*pub_key), None, None],
             type_id,
         }
     }
@@ -601,12 +601,12 @@ impl KeyOption {
     }
 
     /// Export into TL object with public key
-    pub fn into_tl_public_key(&self) -> Result<ton::PublicKey> {
+    pub fn export_tl_public_key(&self) -> Result<ton::PublicKey> {
         if self.type_id != Self::KEY_ED25519 {
             fail!("Export is supported only for Ed25519 keys")
         }
         let ret = Ed25519 {
-            key: ton::int256(self.pub_key()?.clone()),
+            key: ton::int256(*self.pub_key()?),
         }
         .into_boxed();
         Ok(ret)
@@ -676,7 +676,7 @@ impl Query {
             serialize(query)?
         };
         let message = AdnlQueryMessage {
-            query_id: ton::int256(query_id.clone()),
+            query_id: ton::int256(query_id),
             query: ton::bytes(query),
         }
         .into_boxed();
@@ -697,14 +697,14 @@ impl Query {
 
     /// Process ADNL query
     pub async fn process_adnl(
-        subscribers: &Vec<Arc<dyn Subscriber>>,
+        subscribers: &[Arc<dyn Subscriber>],
         query: &AdnlQueryMessage,
         peers: &AdnlPeers,
     ) -> Result<(bool, Option<AdnlMessage>)> {
         if let (true, answer) = Self::process(subscribers, &query.query[..], peers).await? {
             Self::answer(answer, |answer| {
                 AdnlAnswerMessage {
-                    query_id: query.query_id.clone(),
+                    query_id: query.query_id,
                     answer: ton::bytes(answer),
                 }
                 .into_boxed()
@@ -716,7 +716,7 @@ impl Query {
 
     /// Process custom message
     pub async fn process_custom(
-        subscribers: &Vec<Arc<dyn Subscriber>>,
+        subscribers: &[Arc<dyn Subscriber>],
         custom: &AdnlCustomMessage,
         peers: &AdnlPeers,
     ) -> Result<bool> {
@@ -730,13 +730,13 @@ impl Query {
 
     /// Process RLDP query
     pub async fn process_rldp(
-        subscribers: &Vec<Arc<dyn Subscriber>>,
+        subscribers: &[Arc<dyn Subscriber>],
         query: &RldpQuery,
         peers: &AdnlPeers,
     ) -> Result<(bool, Option<RldpAnswer>)> {
         if let (true, answer) = Self::process(subscribers, &query.data[..], peers).await? {
             Self::answer(answer, |answer| RldpAnswer {
-                query_id: query.query_id.clone(),
+                query_id: query.query_id,
                 data: ton::bytes(answer),
             })
         } else {
@@ -757,7 +757,7 @@ impl Query {
     }
 
     async fn process(
-        subscribers: &Vec<Arc<dyn Subscriber>>,
+        subscribers: &[Arc<dyn Subscriber>],
         query: &[u8],
         peers: &AdnlPeers,
     ) -> Result<(bool, Option<Answer>)> {
@@ -888,6 +888,12 @@ impl Version {
 pub struct UpdatedAt {
     started: Instant,
     updated: AtomicU64,
+}
+
+impl Default for UpdatedAt {
+    fn default() -> Self {
+        UpdatedAt::new()
+    }
 }
 
 impl UpdatedAt {
