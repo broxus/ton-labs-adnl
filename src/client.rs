@@ -87,10 +87,15 @@ impl AdnlClient {
             config.timeouts.write().unwrap(),
         )?;
 
+        #[cfg(not(feature = "wasm"))]
         let mut stream = AdnlStream::from_stream_with_timeouts(
             tokio::net::TcpStream::from_std(socket.into_tcp_stream())?,
             config.timeouts(),
         );
+        #[cfg(feature = "wasm")]
+        let mut stream =
+            AdnlStream::from_stream_with_timeouts(socket.into_tcp_stream(), config.timeouts());
+
         Ok(Self {
             crypto: Self::send_init_packet(&mut stream, config).await?,
             stream,
