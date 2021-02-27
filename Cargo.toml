@@ -11,8 +11,7 @@ async-trait = "0.1.22"
 base64 = "0.11.0"
 curve25519-dalek = "2.0.0"
 ed25519 = "1.0.1"
-ed25519-dalek = "1.0.0-pre.4"
-external-ip = { version = "1.0.0", optional = true }
+ed25519-dalek = "1.0"
 failure = "0.1.6"
 futures = "0.3.1"
 log = "0.4.11"
@@ -28,7 +27,6 @@ x25519-dalek = "0.6.0"
 
 ton_api = { git = "https://github.com/broxus/ton-labs-tl.git", branch = "original", package = "ton_api" }
 ton_types = { git = "https://github.com/tonlabs/ton-labs-types.git" }
-lockfree = { git = "https://github.com/tonlabs/lockfree.git" }
 
 [features]
 default = ["multi-threaded"]
@@ -36,7 +34,4 @@ multi-threaded = ["tokio/rt-threaded", "tokio/udp", "tokio/tcp"]
 single-threaded = ["tokio/rt-core", "tokio/udp", "tokio/tcp"]
 wasm = ["tokio/rt-core"]
 
-client = []
-server = []
-node = ["external-ip"]
 trace = []

@@ -6,25 +6,13 @@ use sha2::Digest;
 use std::{
     fmt::{self, Debug, Display, Formatter},
     hash::Hash,
-    sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc,
-    },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    sync::Arc,
+    time::Duration,
 };
 use ton_api::{
     ton::{
         self,
-        adnl::{
-            message::message::{
-                Answer as AdnlAnswerMessage, Custom as AdnlCustomMessage, Query as AdnlQueryMessage,
-            },
-            pong::Pong as AdnlPong,
-            Message as AdnlMessage,
-        },
-        pub_::publickey::Ed25519,
-        rldp::message::{Answer as RldpAnswer, Query as RldpQuery},
-        rpc::adnl::Ping as AdnlPing,
+        adnl::{message::message::Query as AdnlQueryMessage, Message as AdnlMessage},
         TLObject,
     },
     BoxedSerialize, Deserializer, IntoBoxed, Serializer,
@@ -37,7 +25,6 @@ use std::io::{Read, Write};
 #[cfg(not(feature = "wasm"))]
 use tokio::prelude::*;
 
-#[cfg(any(feature = "client", feature = "node", feature = "server"))]
 pub(crate) const TARGET: &str = "adnl";
 
 #[macro_export]
@@ -192,7 +179,6 @@ pub struct AdnlHandshake;
 
 impl AdnlHandshake {
     /// Build handshake packet
-    #[cfg(any(feature = "client", feature = "node"))]
     pub fn build_packet(buf: &mut Vec<u8>, local: &KeyOption, other: &KeyOption) -> Result<()> {
         let checksum = {
             let checksum = sha2::Sha256::digest(&buf[..]);
@@ -214,41 +200,6 @@ impl AdnlHandshake {
         Ok(())
     }
 
-    /// Parse handshake packet
-    #[cfg(any(feature = "server", feature = "node"))]
-    pub fn parse_packet(
-        keys: &lockfree::map::Map<Arc<KeyId>, Arc<KeyOption>>,
-        buf: &mut Vec<u8>,
-        len: Option<usize>,
-    ) -> Result<Option<Arc<KeyId>>> {
-        if buf.len() < 96 + len.unwrap_or(0) {
-            fail!("Bad handshake packet length: {}", buf.len());
-        }
-        for key in keys.iter() {
-            if key.val().id().data().eq(&buf[0..32]) {
-                let mut shared_secret = AdnlCryptoUtils::calc_shared_secret(
-                    key.val().pvt_key()?,
-                    arrayref::array_ref!(buf, 32, 32),
-                );
-                dump!(trace, TARGET, "Shared Secret", &shared_secret);
-                let range = if let Some(len) = len {
-                    96..96 + len
-                } else {
-                    96..buf.len()
-                };
-                Self::build_packet_cipher(&mut shared_secret, arrayref::array_ref!(buf, 64, 32))
-                    .apply_keystream(&mut buf[range]);
-                if !sha2::Sha256::digest(&buf[96..]).as_slice().eq(&buf[64..96]) {
-                    fail!("Bad handshake packet checksum");
-                }
-                buf.drain(0..96);
-                return Ok(Some(key.key().clone()));
-            }
-        }
-        Ok(None)
-    }
-
-    #[cfg(any(feature = "client", feature = "server", feature = "node"))]
     fn build_packet_cipher(
         shared_secret: &mut [u8; 32],
         checksum: &[u8; 32],
@@ -290,19 +241,6 @@ impl AdnlPeers {
     pub fn set_other(&mut self, other: Arc<KeyId>) {
         let AdnlPeers(_, old_other) = self;
         *old_other = other
-    }
-}
-
-/// ADNL ping subscriber
-pub struct AdnlPingSubscriber;
-
-#[async_trait::async_trait]
-impl Subscriber for AdnlPingSubscriber {
-    async fn try_consume_query(&self, object: TLObject, _peers: &AdnlPeers) -> Result<QueryResult> {
-        match object.downcast::<AdnlPing>() {
-            Ok(ping) => QueryResult::consume(AdnlPong { value: ping.value }),
-            Err(object) => Ok(QueryResult::Rejected(object)),
-        }
     }
 }
 
@@ -376,25 +314,12 @@ pub struct AdnlStreamCrypto {
 
 impl AdnlStreamCrypto {
     /// Construct as client
-    #[cfg(feature = "client")]
     pub fn with_nonce_as_client(nonce: &[u8; 160]) -> Self {
         /* Do not clear nonce because it will be encrypted inplace afterwards */
         Self {
             cipher_recv: AdnlCryptoUtils::build_cipher_unsecure(nonce, 0..32, 64..80),
             cipher_send: AdnlCryptoUtils::build_cipher_unsecure(nonce, 32..64, 80..96),
         }
-    }
-
-    /// Construct as server
-    #[cfg(feature = "server")]
-    pub fn with_nonce_as_server(nonce: &mut [u8; 160]) -> Self {
-        /* Clear nonce */
-        let ret = Self {
-            cipher_recv: AdnlCryptoUtils::build_cipher_unsecure(nonce, 32..64, 80..96),
-            cipher_send: AdnlCryptoUtils::build_cipher_unsecure(nonce, 0..32, 64..80),
-        };
-        nonce.iter_mut().for_each(|a| *a = 0);
-        ret
     }
 
     /// Send data in-place
@@ -434,12 +359,6 @@ impl AdnlStreamCrypto {
     }
 }
 
-/// ADNL/RLDP answer
-pub enum Answer {
-    Object(TLObject),
-    Raw(Vec<u8>),
-}
-
 /// ADNL key ID (node ID)
 #[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize)]
 pub struct KeyId([u8; 32]);
@@ -463,7 +382,8 @@ impl Display for KeyId {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct KeyOption {
     id: Arc<KeyId>,
-    keys: [Option<[u8; 32]>; 3], // public(0) private-lo(1) private-hi(2) keys
+    keys: [Option<[u8; 32]>; 3],
+    // public(0) private-lo(1) private-hi(2) keys
     type_id: i32,
 }
 
@@ -538,26 +458,6 @@ impl KeyOption {
             keys: [Some(pub_key), None, None],
             type_id: src.type_id,
         })
-    }
-
-    /// Create from TL object with public key
-    pub fn from_tl_public_key(src: &ton::PublicKey) -> Result<Self> {
-        if let ton::PublicKey::Pub_Ed25519(key) = src {
-            Ok(Self::from_type_and_public_key(
-                Self::KEY_ED25519,
-                &key.key.0,
-            ))
-        } else {
-            fail!("Unsupported public key type {:?}", src)
-        }
-    }
-
-    /// Create from TL serialized public key
-    pub fn from_tl_serialized_public_key(src: &[u8]) -> Result<Self> {
-        let pub_key = deserialize(src)?
-            .downcast::<ton::PublicKey>()
-            .map_err(|key| failure::format_err!("Unsupported PublicKey data {:?}", key))?;
-        Self::from_tl_public_key(&pub_key)
     }
 
     /// Create from type and private key
@@ -637,18 +537,6 @@ impl KeyOption {
         self.type_id
     }
 
-    /// Export into TL object with public key
-    pub fn export_tl_public_key(&self) -> Result<ton::PublicKey> {
-        if self.type_id != Self::KEY_ED25519 {
-            fail!("Export is supported only for Ed25519 keys")
-        }
-        let ret = Ed25519 {
-            key: ton::int256(*self.pub_key()?),
-        }
-        .into_boxed();
-        Ok(ret)
-    }
-
     /// Generate signature
     pub fn sign(&self, data: &[u8]) -> Result<[u8; 64]> {
         if self.type_id != Self::KEY_ED25519 {
@@ -688,20 +576,9 @@ impl KeyOption {
 
 /// ADNL/RLDP Query
 #[derive(Debug)]
-pub enum Query {
-    Received(Vec<u8>),
-    Sent(Arc<tokio::sync::Barrier>),
-    Timeout,
-}
+pub struct Query;
 
 impl Query {
-    /// Construct new query
-    pub fn new() -> (Arc<tokio::sync::Barrier>, Self) {
-        let ping = Arc::new(tokio::sync::Barrier::new(2));
-        let pong = ping.clone();
-        (ping, Query::Sent(pong))
-    }
-
     /// Build query
     pub fn build(prefix: Option<&[u8]>, query: &TLObject) -> Result<(QueryId, AdnlMessage)> {
         let query_id: QueryId = rand::thread_rng().gen();
@@ -731,155 +608,10 @@ impl Query {
             Err(answer) => fail!("Unsupported response to {:?}: {:?}", query, answer),
         }
     }
-
-    /// Process ADNL query
-    pub async fn process_adnl(
-        subscribers: &[Arc<dyn Subscriber>],
-        query: &AdnlQueryMessage,
-        peers: &AdnlPeers,
-    ) -> Result<(bool, Option<AdnlMessage>)> {
-        if let (true, answer) = Self::process(subscribers, &query.query[..], peers).await? {
-            Self::answer(answer, |answer| {
-                AdnlAnswerMessage {
-                    query_id: query.query_id,
-                    answer: ton::bytes(answer),
-                }
-                .into_boxed()
-            })
-        } else {
-            Ok((false, None))
-        }
-    }
-
-    /// Process custom message
-    pub async fn process_custom(
-        subscribers: &[Arc<dyn Subscriber>],
-        custom: &AdnlCustomMessage,
-        peers: &AdnlPeers,
-    ) -> Result<bool> {
-        for subscriber in subscribers.iter() {
-            if subscriber.try_consume_custom(&custom.data, peers).await? {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    /// Process RLDP query
-    pub async fn process_rldp(
-        subscribers: &[Arc<dyn Subscriber>],
-        query: &RldpQuery,
-        peers: &AdnlPeers,
-    ) -> Result<(bool, Option<RldpAnswer>)> {
-        if let (true, answer) = Self::process(subscribers, &query.data[..], peers).await? {
-            Self::answer(answer, |answer| RldpAnswer {
-                query_id: query.query_id,
-                data: ton::bytes(answer),
-            })
-        } else {
-            Ok((false, None))
-        }
-    }
-
-    fn answer<A>(
-        answer: Option<Answer>,
-        convert: impl Fn(Vec<u8>) -> A,
-    ) -> Result<(bool, Option<A>)> {
-        let answer = match answer {
-            Some(Answer::Object(x)) => Some(serialize(&x)?),
-            Some(Answer::Raw(x)) => Some(x),
-            None => None,
-        };
-        Ok((true, answer.map(convert)))
-    }
-
-    async fn process(
-        subscribers: &[Arc<dyn Subscriber>],
-        query: &[u8],
-        peers: &AdnlPeers,
-    ) -> Result<(bool, Option<Answer>)> {
-        let mut queries = deserialize_bundle(query)?;
-        if queries.len() == 1 {
-            let mut query = queries.remove(0);
-            for subscriber in subscribers.iter() {
-                query = match subscriber.try_consume_query(query, peers).await? {
-                    QueryResult::Consumed(answer) => return Ok((true, answer)),
-                    QueryResult::Rejected(query) => query,
-                    QueryResult::RejectedBundle(_) => unreachable!(),
-                };
-            }
-        } else {
-            for subscriber in subscribers.iter() {
-                queries = match subscriber.try_consume_query_bundle(queries, peers).await? {
-                    QueryResult::Consumed(answer) => return Ok((true, answer)),
-                    QueryResult::Rejected(_) => unreachable!(),
-                    QueryResult::RejectedBundle(queries) => queries,
-                };
-            }
-        };
-        Ok((false, None))
-    }
 }
-
-/// ADNL query cache
-//pub type QueryCache = HashMap<QueryId, Query>;
-pub type QueryCache = lockfree::map::Map<QueryId, Query>;
 
 /// ADNL query ID
 pub type QueryId = [u8; 32];
-
-/// ADNL/RLDP query consumption result
-pub enum QueryResult {
-    /// Consumed with optional answer
-    Consumed(Option<Answer>),
-    /// Rejected
-    Rejected(TLObject),
-    /// Rejected bundle
-    RejectedBundle(Vec<TLObject>),
-}
-
-impl QueryResult {
-    /// Consume plain helper
-    pub fn consume<A: IntoBoxed>(answer: A) -> Result<Self>
-    where
-        <A as IntoBoxed>::Boxed: Send + Sync + serde::Serialize + 'static,
-    {
-        Ok(QueryResult::Consumed(Some(Answer::Object(TLObject::new(
-            answer.into_boxed(),
-        )))))
-    }
-
-    /// Consume boxed helper
-    pub fn consume_boxed<A>(answer: A) -> Result<Self>
-    where
-        A: BoxedSerialize + Send + Sync + serde::Serialize + 'static,
-    {
-        Ok(QueryResult::Consumed(Some(Answer::Object(TLObject::new(
-            answer,
-        )))))
-    }
-}
-
-/// ADNL subscriber
-#[async_trait::async_trait]
-pub trait Subscriber: Send + Sync {
-    /// Try consume custom data: data -> consumed yes/no
-    async fn try_consume_custom(&self, _data: &[u8], _peers: &AdnlPeers) -> Result<bool> {
-        Ok(false)
-    }
-    /// Try consume query: object -> result
-    async fn try_consume_query(&self, object: TLObject, _peers: &AdnlPeers) -> Result<QueryResult> {
-        Ok(QueryResult::Rejected(object))
-    }
-    /// Try consume query bundle: objects -> result
-    async fn try_consume_query_bundle(
-        &self,
-        objects: Vec<TLObject>,
-        _peers: &AdnlPeers,
-    ) -> Result<QueryResult> {
-        Ok(QueryResult::RejectedBundle(objects))
-    }
-}
 
 /// Network timeouts
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
@@ -906,154 +638,6 @@ impl Default for Timeouts {
             read: Self::DEFAULT_TIMEOUT,
             write: Self::DEFAULT_TIMEOUT,
         }
-    }
-}
-
-/// Data structure version
-pub struct Version;
-
-impl Version {
-    pub fn get() -> i32 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i32
-    }
-}
-
-/// Data structure update timestamp
-pub struct UpdatedAt {
-    started: Instant,
-    updated: AtomicU64,
-}
-
-impl Default for UpdatedAt {
-    fn default() -> Self {
-        UpdatedAt::new()
-    }
-}
-
-impl UpdatedAt {
-    pub fn new() -> Self {
-        Self {
-            started: Instant::now(),
-            updated: AtomicU64::new(0),
-        }
-    }
-    pub fn refresh(&self) {
-        self.updated
-            .store(self.started.elapsed().as_secs(), Ordering::Relaxed)
-    }
-    pub fn is_expired(&self, timeout: u64) -> bool {
-        self.started.elapsed().as_secs() - self.updated.load(Ordering::Relaxed) >= timeout
-    }
-}
-
-pub struct Wait<T> {
-    count: AtomicUsize,
-    queue_sender: tokio::sync::mpsc::UnboundedSender<Option<T>>,
-}
-
-impl<T> Wait<T> {
-    pub fn new() -> (Arc<Self>, tokio::sync::mpsc::UnboundedReceiver<Option<T>>) {
-        let (queue_sender, queue_reader) = tokio::sync::mpsc::unbounded_channel();
-        let ret = Self {
-            count: AtomicUsize::new(0),
-            queue_sender,
-        };
-        (Arc::new(ret), queue_reader)
-    }
-
-    pub fn count(&self) -> usize {
-        self.count.load(Ordering::Relaxed)
-    }
-
-    pub fn request(&self) -> usize {
-        self.count.fetch_add(1, Ordering::Relaxed)
-    }
-
-    pub fn respond(&self, val: Option<T>) {
-        match self.queue_sender.send(val) {
-            Ok(()) => (),
-            Err(tokio::sync::mpsc::error::SendError(_)) => (),
-        }
-    }
-
-    pub async fn wait(
-        &self,
-        queue_reader: &mut tokio::sync::mpsc::UnboundedReceiver<Option<T>>,
-        only_one: bool,
-    ) -> Option<Option<T>> {
-        let mut empty = self.count.load(Ordering::Relaxed) == 0;
-        let mut ret = None;
-        if !empty {
-            ret = queue_reader.recv().await;
-            match ret {
-                Some(ref item) => {
-                    self.count.fetch_sub(1, Ordering::Relaxed);
-                    if item.is_some() && only_one {
-                        empty = true
-                    }
-                }
-                None => empty = true,
-            }
-        }
-        if empty {
-            // Graceful close
-            queue_reader.close();
-            while queue_reader.recv().await.is_some() {}
-        }
-        ret
-    }
-}
-
-/// Add object to map
-pub fn add_object_to_map<K: Hash + Ord, V>(
-    to: &lockfree::map::Map<K, V>,
-    key: K,
-    mut factory: impl FnMut() -> Result<V>,
-) -> Result<bool> {
-    add_object_to_map_with_update(to, key, |found| {
-        if found.is_some() {
-            Ok(None)
-        } else {
-            Ok(Some(factory()?))
-        }
-    })
-}
-
-/// Add or update object in map
-pub fn add_object_to_map_with_update<K: Hash + Ord, V>(
-    to: &lockfree::map::Map<K, V>,
-    key: K,
-    mut factory: impl FnMut(Option<&V>) -> Result<Option<V>>,
-) -> Result<bool> {
-    let mut error = None;
-    let insertion = to.insert_with(key, |_, inserted, found| {
-        let found = if let Some((_, found)) = found {
-            Some(found)
-        } else if inserted.is_some() {
-            return lockfree::map::Preview::Keep;
-        } else {
-            None
-        };
-        match factory(found) {
-            Err(err) => error = Some(err),
-            Ok(Some(value)) => return lockfree::map::Preview::New(value),
-            _ => (),
-        }
-        lockfree::map::Preview::Discard
-    });
-    match insertion {
-        lockfree::map::Insertion::Created => Ok(true),
-        lockfree::map::Insertion::Failed(_) => {
-            if let Some(error) = error {
-                Err(error)
-            } else {
-                Ok(false)
-            }
-        }
-        lockfree::map::Insertion::Updated(_) => Ok(true),
     }
 }
 
