@@ -1,37 +1,39 @@
 [package]
 edition = "2018"
 name = "adnl"
-version = "0.0.5"
+version = "0.2.0"
 description = "ADNL library"
 
 [dependencies]
-aes-ctr = "0.3.0"
+aes = { version = "0.7.1", features = ["ctr"] }
+cipher = "0.3.0"
 arrayref = "0.3.5"
 async-trait = "0.1.22"
-base64 = "0.11.0"
-curve25519-dalek = "2.0.0"
+base64 = "0.13.0"
+curve25519-dalek = "3.0"
 ed25519 = "1.0.1"
 ed25519-dalek = "1.0"
 failure = "0.1.6"
-futures = "0.3.1"
+futures = "0.3.15"
 log = "0.4.11"
 rand = "0.7.2"
 serde = { version = "1.0.105", features = ["derive", "rc"] }
 serde_json = "1.0.41"
-sha2 = "0.8.0"
-socket2 = "0.3.11"
-stream-cancel = "0.6.1"
-tokio = { version = "0.2.5", features = ["stream"] }
-tokio-io-timeout = "0.4.0"
-x25519-dalek = "0.6.0"
+sha2 = "0.9.5"
+socket2 = "0.3.19"
+stream-cancel = "0.8"
+tokio = { version = "1", features = ["io-util"] }
+tokio-stream = "0.1.5"
+tokio-io-timeout = "1.1.1"
+x25519-dalek = "1"
 
 ton_api = { git = "https://github.com/broxus/ton-labs-tl.git", branch = "original", package = "ton_api" }
 ton_types = { git = "https://github.com/tonlabs/ton-labs-types.git" }
 
 [features]
 default = ["multi-threaded"]
-multi-threaded = ["tokio/rt-threaded", "tokio/udp", "tokio/tcp"]
-single-threaded = ["tokio/rt-core", "tokio/udp", "tokio/tcp"]
-wasm = ["tokio/rt-core"]
+multi-threaded = ["tokio/rt-multi-thread", "tokio/net"]
+single-threaded = ["tokio/rt", "tokio/net"]
+wasm = ["tokio/rt"]
 
 trace = []
