@@ -1,29 +1,28 @@
-use aes_ctr::stream_cipher::{NewStreamCipher, SyncStreamCipher};
-use core::ops::Range;
-use ed25519::signature::{Signature, Verifier};
-use rand::Rng;
-use sha2::Digest;
 use std::{
     fmt::{self, Debug, Display, Formatter},
     hash::Hash,
     sync::Arc,
     time::Duration,
 };
-use ton_api::{
-    ton::{
-        self,
-        adnl::{message::message::Query as AdnlQueryMessage, Message as AdnlMessage},
-        TLObject,
-    },
-    BoxedSerialize, Deserializer, IntoBoxed, Serializer,
-};
-use ton_types::{fail, Result};
-
 #[cfg(feature = "wasm")]
 use std::io::{Read, Write};
+use std::ops::Range;
 
+use cipher::{generic_array, NewCipher, StreamCipher};
+use ed25519::signature::{Signature, Verifier};
+use rand::Rng;
+use sha2::Digest;
 #[cfg(not(feature = "wasm"))]
-use tokio::prelude::*;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use ton_api::{
+    BoxedSerialize,
+    Deserializer, IntoBoxed, Serializer, ton::{
+        self,
+        adnl::{Message as AdnlMessage, message::message::Query as AdnlQueryMessage},
+        TLObject,
+    },
+};
+use ton_types::{fail, Result};
 
 pub(crate) const TARGET: &str = "adnl";
 
@@ -140,7 +139,7 @@ pub struct AdnlCryptoUtils;
 
 impl AdnlCryptoUtils {
     /// Build AES-based cipher with clearing key data
-    pub fn build_cipher_secure(key: &mut [u8], ctr: &mut [u8]) -> aes_ctr::Aes256Ctr {
+    pub fn build_cipher_secure(key: &mut [u8], ctr: &mut [u8]) -> aes::Aes256Ctr {
         let ret = Self::build_cipher_internal(key, ctr);
         key.iter_mut().for_each(|a| *a = 0);
         ctr.iter_mut().for_each(|a| *a = 0);
@@ -152,7 +151,7 @@ impl AdnlCryptoUtils {
         nonce: &[u8; 160],
         range_key: Range<usize>,
         range_ctr: Range<usize>,
-    ) -> aes_ctr::Aes256Ctr {
+    ) -> aes::Aes256Ctr {
         Self::build_cipher_internal(&nonce[range_key], &nonce[range_ctr])
     }
 
@@ -166,10 +165,10 @@ impl AdnlCryptoUtils {
         x25519_dalek::x25519(*pvt_key, point)
     }
 
-    fn build_cipher_internal(key: &[u8], ctr: &[u8]) -> aes_ctr::Aes256Ctr {
-        aes_ctr::Aes256Ctr::new(
-            aes_ctr::stream_cipher::generic_array::GenericArray::from_slice(key),
-            aes_ctr::stream_cipher::generic_array::GenericArray::from_slice(ctr),
+    fn build_cipher_internal(key: &[u8], ctr: &[u8]) -> aes::Aes256Ctr {
+        aes::Aes256Ctr::new(
+            generic_array::GenericArray::from_slice(key),
+            generic_array::GenericArray::from_slice(ctr),
         )
     }
 }
@@ -203,7 +202,7 @@ impl AdnlHandshake {
     fn build_packet_cipher(
         shared_secret: &mut [u8; 32],
         checksum: &[u8; 32],
-    ) -> aes_ctr::Aes256Ctr {
+    ) -> aes::Aes256Ctr {
         let x = &shared_secret[..];
         let y = &checksum[..];
         let mut aes_key_bytes = from_slice!(x, 0, 16, y, 16, 16);
@@ -274,10 +273,10 @@ impl AdnlStream {
         buf.resize(len, 0);
 
         #[cfg(not(feature = "wasm"))]
-        self.0.read_exact(&mut buf[..]).await?;
+            self.0.get_mut().read_exact(&mut buf[..]).await?;
 
         #[cfg(feature = "wasm")]
-        self.0.read_exact(&mut buf[..])?;
+            self.0.read_exact(&mut buf[..])?;
 
         Ok(())
     }
@@ -285,10 +284,10 @@ impl AdnlStream {
     /// Shutdown stream
     pub async fn shutdown(&mut self) -> Result<()> {
         #[cfg(not(feature = "wasm"))]
-        self.0.shutdown().await?;
+            self.0.get_mut().shutdown().await?;
 
         #[cfg(feature = "wasm")]
-        self.0.shutdown(std::net::Shutdown::Both)?;
+            self.0.shutdown(std::net::Shutdown::Both)?;
 
         Ok(())
     }
@@ -296,10 +295,10 @@ impl AdnlStream {
     /// Write to stream
     pub async fn write(&mut self, buf: &mut Vec<u8>) -> Result<()> {
         #[cfg(not(feature = "wasm"))]
-        self.0.write_all(&buf[..]).await?;
+            self.0.get_mut().write_all(&buf[..]).await?;
 
         #[cfg(feature = "wasm")]
-        self.0.write_all(&buf[..])?;
+            self.0.write_all(&buf[..])?;
 
         buf.truncate(0);
         Ok(())
@@ -308,8 +307,8 @@ impl AdnlStream {
 
 /// ADNL stream cryptographic context
 pub struct AdnlStreamCrypto {
-    cipher_recv: aes_ctr::Aes256Ctr,
-    cipher_send: aes_ctr::Aes256Ctr,
+    cipher_recv: aes::Aes256Ctr,
+    cipher_send: aes::Aes256Ctr,
 }
 
 impl AdnlStreamCrypto {
@@ -566,9 +565,9 @@ impl KeyOption {
     /// Calculate key ID
     fn calc_id(type_id: i32, pub_key: &[u8; 32]) -> Arc<KeyId> {
         let mut sha = sha2::Sha256::new();
-        sha.input(&type_id.to_le_bytes());
-        sha.input(pub_key);
-        let buf = sha.result_reset();
+        sha.update(&type_id.to_le_bytes());
+        sha.update(pub_key);
+        let buf = sha.finalize();
         let src = buf.as_slice();
         KeyId::from_data(from_slice!(src, 32))
     }
@@ -593,15 +592,15 @@ impl Query {
             query_id: ton::int256(query_id),
             query: ton::bytes(query),
         }
-        .into_boxed();
+            .into_boxed();
         Ok((query_id, message))
     }
 
     /// Parse answer
     pub fn parse<Q, A>(answer: TLObject, query: &Q) -> Result<A>
-    where
-        A: BoxedSerialize + Send + Sync + serde::Serialize + 'static,
-        Q: Debug,
+        where
+            A: BoxedSerialize + Send + Sync + serde::Serialize + 'static,
+            Q: Debug,
     {
         match answer.downcast::<A>() {
             Ok(answer) => Ok(answer),
