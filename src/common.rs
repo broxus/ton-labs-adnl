@@ -273,7 +273,7 @@ impl AdnlStream {
         buf.resize(len, 0);
 
         #[cfg(not(feature = "wasm"))]
-            self.0.read_exact(&mut buf[..]).await?;
+            self.0.get_mut().read_exact(&mut buf[..]).await?;
 
         #[cfg(feature = "wasm")]
             self.0.read_exact(&mut buf[..])?;
@@ -284,7 +284,7 @@ impl AdnlStream {
     /// Shutdown stream
     pub async fn shutdown(&mut self) -> Result<()> {
         #[cfg(not(feature = "wasm"))]
-            self.0.shutdown().await?;
+            self.0.get_mut().shutdown().await?;
 
         #[cfg(feature = "wasm")]
             self.0.shutdown(std::net::Shutdown::Both)?;
@@ -295,7 +295,7 @@ impl AdnlStream {
     /// Write to stream
     pub async fn write(&mut self, buf: &mut Vec<u8>) -> Result<()> {
         #[cfg(not(feature = "wasm"))]
-            self.0.write_all(&buf[..]).await?;
+            self.0.get_mut().write_all(&buf[..]).await?;
 
         #[cfg(feature = "wasm")]
             self.0.write_all(&buf[..])?;
