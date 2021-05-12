@@ -1,12 +1,12 @@
+#[cfg(feature = "wasm")]
+use std::io::{Read, Write};
+use std::ops::Range;
 use std::{
     fmt::{self, Debug, Display, Formatter},
     hash::Hash,
     sync::Arc,
     time::Duration,
 };
-#[cfg(feature = "wasm")]
-use std::io::{Read, Write};
-use std::ops::Range;
 
 use cipher::{generic_array, NewCipher, StreamCipher};
 use ed25519::signature::{Signature, Verifier};
@@ -15,12 +15,12 @@ use sha2::Digest;
 #[cfg(not(feature = "wasm"))]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use ton_api::{
-    BoxedSerialize,
-    Deserializer, IntoBoxed, Serializer, ton::{
+    ton::{
         self,
-        adnl::{Message as AdnlMessage, message::message::Query as AdnlQueryMessage},
+        adnl::{message::message::Query as AdnlQueryMessage, Message as AdnlMessage},
         TLObject,
     },
+    BoxedSerialize, Deserializer, IntoBoxed, Serializer,
 };
 use ton_types::{fail, Result};
 
@@ -199,10 +199,7 @@ impl AdnlHandshake {
         Ok(())
     }
 
-    fn build_packet_cipher(
-        shared_secret: &mut [u8; 32],
-        checksum: &[u8; 32],
-    ) -> aes::Aes256Ctr {
+    fn build_packet_cipher(shared_secret: &mut [u8; 32], checksum: &[u8; 32]) -> aes::Aes256Ctr {
         let x = &shared_secret[..];
         let y = &checksum[..];
         let mut aes_key_bytes = from_slice!(x, 0, 16, y, 16, 16);
@@ -273,10 +270,10 @@ impl AdnlStream {
         buf.resize(len, 0);
 
         #[cfg(not(feature = "wasm"))]
-            self.0.get_mut().read_exact(&mut buf[..]).await?;
+        self.0.get_mut().read_exact(&mut buf[..]).await?;
 
         #[cfg(feature = "wasm")]
-            self.0.read_exact(&mut buf[..])?;
+        self.0.read_exact(&mut buf[..])?;
 
         Ok(())
     }
@@ -284,10 +281,10 @@ impl AdnlStream {
     /// Shutdown stream
     pub async fn shutdown(&mut self) -> Result<()> {
         #[cfg(not(feature = "wasm"))]
-            self.0.get_mut().shutdown().await?;
+        self.0.get_mut().shutdown().await?;
 
         #[cfg(feature = "wasm")]
-            self.0.shutdown(std::net::Shutdown::Both)?;
+        self.0.shutdown(std::net::Shutdown::Both)?;
 
         Ok(())
     }
@@ -295,10 +292,10 @@ impl AdnlStream {
     /// Write to stream
     pub async fn write(&mut self, buf: &mut Vec<u8>) -> Result<()> {
         #[cfg(not(feature = "wasm"))]
-            self.0.get_mut().write_all(&buf[..]).await?;
+        self.0.get_mut().write_all(&buf[..]).await?;
 
         #[cfg(feature = "wasm")]
-            self.0.write_all(&buf[..])?;
+        self.0.write_all(&buf[..])?;
 
         buf.truncate(0);
         Ok(())
@@ -592,15 +589,15 @@ impl Query {
             query_id: ton::int256(query_id),
             query: ton::bytes(query),
         }
-            .into_boxed();
+        .into_boxed();
         Ok((query_id, message))
     }
 
     /// Parse answer
     pub fn parse<Q, A>(answer: TLObject, query: &Q) -> Result<A>
-        where
-            A: BoxedSerialize + Send + Sync + serde::Serialize + 'static,
-            Q: Debug,
+    where
+        A: BoxedSerialize + Send + Sync + serde::Serialize + 'static,
+        Q: Debug,
     {
         match answer.downcast::<A>() {
             Ok(answer) => Ok(answer),
