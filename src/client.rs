@@ -71,11 +71,11 @@ pub struct AdnlConnection {
     stream: AdnlStream,
 }
 
-pub struct AdelClient {
+pub struct AdnlClient {
     config: AdnlClientConfig,
 }
 
-impl AdelClient {
+impl AdnlClient {
     pub fn new(config: AdnlClientConfig) -> Self {
         Self { config }
     }
