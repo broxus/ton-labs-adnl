@@ -12,7 +12,7 @@ use std::{
 };
 use ton_api::ton::{
     adnl::{Message as AdnlMessage, Pong as AdnlPongBoxed},
-    rpc::adnl::Ping as AdnlPing,
+    rpc::tcp::Ping as TcpPing,
     TLObject,
 };
 
@@ -100,11 +100,11 @@ impl AdnlClient {
     /// Ping server
     pub async fn ping(&mut self) -> Result<u64> {
         let now = SystemTime::now();
-        let value = rand::thread_rng().gen();
-        let query = TLObject::new(AdnlPing { value });
+        let random_id = rand::thread_rng().gen();
+        let query = TLObject::new(TcpPing { random_id });
         let answer: AdnlPongBoxed = Query::parse(self.query(&query).await?, &query)?;
-        if answer.value() != &value {
-            fail!("Bad reply to ADNL ping")
+        if answer.value() != &random_id {
+            fail!("Bad reply to TCP ping")
         }
         Ok(now.elapsed()?.as_secs())
     }
