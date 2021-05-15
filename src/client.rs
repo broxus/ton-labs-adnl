@@ -62,26 +62,12 @@ impl AdnlClientConfig {
 }
 
 /// ADNL client
-pub struct AdnlConnection {
+pub struct AdnlClient {
     crypto: AdnlStreamCrypto,
     stream: AdnlStream,
 }
 
-pub struct AdnlClient {
-    config: AdnlClientConfig,
-}
-
 impl AdnlClient {
-    pub fn new(config: AdnlClientConfig) -> Self {
-        Self { config }
-    }
-
-    pub async fn get_connection(&self) -> Result<AdnlConnection> {
-        AdnlConnection::connect(&self.config).await
-    }
-}
-
-impl AdnlConnection {
     /// Connect to server
     pub async fn connect(config: &AdnlClientConfig) -> Result<Self> {
         let socket = socket2::Socket::new(
