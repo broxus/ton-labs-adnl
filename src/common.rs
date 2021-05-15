@@ -1,4 +1,4 @@
-use aes_ctr::stream_cipher::{NewStreamCipher, SyncStreamCipher};
+use aes_ctr::cipher::stream::{NewStreamCipher, SyncStreamCipher};
 use core::ops::Range;
 use ed25519::signature::{Signature, Verifier};
 use rand::Rng;
@@ -9,6 +9,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use ton_api::{
     ton::{
         self,
@@ -18,12 +19,6 @@ use ton_api::{
     BoxedSerialize, Deserializer, IntoBoxed, Serializer,
 };
 use ton_types::{fail, Result};
-
-#[cfg(feature = "wasm")]
-use std::io::{Read, Write};
-
-#[cfg(not(feature = "wasm"))]
-use tokio::prelude::*;
 
 pub(crate) const TARGET: &str = "adnl";
 
@@ -168,8 +163,8 @@ impl AdnlCryptoUtils {
 
     fn build_cipher_internal(key: &[u8], ctr: &[u8]) -> aes_ctr::Aes256Ctr {
         aes_ctr::Aes256Ctr::new(
-            aes_ctr::stream_cipher::generic_array::GenericArray::from_slice(key),
-            aes_ctr::stream_cipher::generic_array::GenericArray::from_slice(ctr),
+            aes_ctr::cipher::generic_array::GenericArray::from_slice(key),
+            aes_ctr::cipher::generic_array::GenericArray::from_slice(ctr),
         )
     }
 }
@@ -244,17 +239,13 @@ impl AdnlPeers {
     }
 }
 
-#[cfg(not(feature = "wasm"))]
 type AdnlStreamInner = tokio_io_timeout::TimeoutStream<tokio::net::TcpStream>;
-#[cfg(feature = "wasm")]
-type AdnlStreamInner = std::net::TcpStream;
 
 /// ADNL TCP stream
 pub struct AdnlStream(AdnlStreamInner);
 
 impl AdnlStream {
     /// Constructor
-    #[cfg(not(feature = "wasm"))]
     pub fn from_stream_with_timeouts(stream: tokio::net::TcpStream, timeouts: &Timeouts) -> Self {
         let mut stream = tokio_io_timeout::TimeoutStream::new(stream);
         stream.set_write_timeout(timeouts.write());
@@ -262,45 +253,25 @@ impl AdnlStream {
         Self(stream)
     }
 
-    #[cfg(feature = "wasm")]
-    pub fn from_stream_with_timeouts(stream: std::net::TcpStream, timeouts: &Timeouts) -> Self {
-        stream.set_read_timeout(Some(timeouts.read)).unwrap();
-        stream.set_write_timeout(Some(timeouts.write)).unwrap();
-        Self(stream)
-    }
-
     /// Read from stream
     pub async fn read(&mut self, buf: &mut Vec<u8>, len: usize) -> Result<()> {
         buf.resize(len, 0);
-
-        #[cfg(not(feature = "wasm"))]
-        self.0.read_exact(&mut buf[..]).await?;
-
-        #[cfg(feature = "wasm")]
-        self.0.read_exact(&mut buf[..])?;
-
+        let Self(stream) = self;
+        stream.get_mut().read_exact(&mut buf[..]).await?;
         Ok(())
     }
 
     /// Shutdown stream
     pub async fn shutdown(&mut self) -> Result<()> {
-        #[cfg(not(feature = "wasm"))]
-        self.0.shutdown().await?;
-
-        #[cfg(feature = "wasm")]
-        self.0.shutdown(std::net::Shutdown::Both)?;
-
+        let Self(stream) = self;
+        stream.get_mut().shutdown().await?;
         Ok(())
     }
 
     /// Write to stream
     pub async fn write(&mut self, buf: &mut Vec<u8>) -> Result<()> {
-        #[cfg(not(feature = "wasm"))]
-        self.0.write_all(&buf[..]).await?;
-
-        #[cfg(feature = "wasm")]
-        self.0.write_all(&buf[..])?;
-
+        let Self(stream) = self;
+        stream.get_mut().write_all(&buf[..]).await?;
         buf.truncate(0);
         Ok(())
     }
