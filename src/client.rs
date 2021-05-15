@@ -10,11 +10,7 @@ use std::{
     net::SocketAddr,
     time::{Duration, SystemTime},
 };
-use ton_api::ton::{
-    adnl::{Message as AdnlMessage, Pong as AdnlPongBoxed},
-    rpc::adnl::Ping as AdnlPing,
-    TLObject,
-};
+use ton_api::ton::{adnl::Message as AdnlMessage, rpc::tcp::Ping as TcpPing, TLObject};
 
 use ton_types::{fail, Result};
 
@@ -101,15 +97,10 @@ impl AdnlConnection {
             config.timeouts.write().unwrap(),
         )?;
 
-        #[cfg(not(feature = "wasm"))]
         let mut stream = AdnlStream::from_stream_with_timeouts(
             tokio::net::TcpStream::from_std(socket.into_tcp_stream())?,
             config.timeouts(),
         );
-        #[cfg(feature = "wasm")]
-        let mut stream =
-            AdnlStream::from_stream_with_timeouts(socket.into_tcp_stream(), config.timeouts());
-
         Ok(Self {
             crypto: Self::send_init_packet(&mut stream, config).await?,
             stream,
@@ -119,12 +110,26 @@ impl AdnlConnection {
     /// Ping server
     pub async fn ping(&mut self) -> Result<u64> {
         let now = SystemTime::now();
-        let value = rand::thread_rng().gen();
-        let query = TLObject::new(AdnlPing { value });
-        let answer: AdnlPongBoxed = Query::parse(self.query(&query).await?, &query)?;
-        if answer.value() != &value {
-            fail!("Bad reply to ADNL ping")
+        let random_id = rand::thread_rng().gen();
+        let query = TLObject::new(TcpPing { random_id });
+
+        let mut buf = serialize(&query)?;
+        self.crypto.send(&mut self.stream, &mut buf).await?;
+        loop {
+            self.crypto.receive(&mut buf, &mut self.stream).await?;
+            if !buf.is_empty() {
+                break;
+            }
         }
+
+        let answer = deserialize(&buf[..])?
+            .downcast::<<TcpPing as ton_api::Function>::Reply>()
+            .map_err(|answer| failure::format_err!("Invalid ping response {:?}", answer))?;
+
+        if answer.random_id() != &random_id {
+            fail!("Bad reply to TCP ping")
+        }
+
         Ok(now.elapsed()?.as_secs())
     }
 

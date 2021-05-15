@@ -1,5 +1,3 @@
-#[cfg(feature = "wasm")]
-use std::io::{Read, Write};
 use std::ops::Range;
 use std::{
     fmt::{self, Debug, Display, Formatter},
@@ -12,7 +10,6 @@ use cipher::{generic_array, NewCipher, StreamCipher};
 use ed25519::signature::{Signature, Verifier};
 use rand::Rng;
 use sha2::Digest;
-#[cfg(not(feature = "wasm"))]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use ton_api::{
     ton::{
@@ -240,17 +237,13 @@ impl AdnlPeers {
     }
 }
 
-#[cfg(not(feature = "wasm"))]
 type AdnlStreamInner = tokio_io_timeout::TimeoutStream<tokio::net::TcpStream>;
-#[cfg(feature = "wasm")]
-type AdnlStreamInner = std::net::TcpStream;
 
 /// ADNL TCP stream
 pub struct AdnlStream(AdnlStreamInner);
 
 impl AdnlStream {
     /// Constructor
-    #[cfg(not(feature = "wasm"))]
     pub fn from_stream_with_timeouts(stream: tokio::net::TcpStream, timeouts: &Timeouts) -> Self {
         let mut stream = tokio_io_timeout::TimeoutStream::new(stream);
         stream.set_write_timeout(timeouts.write());
@@ -258,45 +251,23 @@ impl AdnlStream {
         Self(stream)
     }
 
-    #[cfg(feature = "wasm")]
-    pub fn from_stream_with_timeouts(stream: std::net::TcpStream, timeouts: &Timeouts) -> Self {
-        stream.set_read_timeout(Some(timeouts.read)).unwrap();
-        stream.set_write_timeout(Some(timeouts.write)).unwrap();
-        Self(stream)
-    }
-
     /// Read from stream
     pub async fn read(&mut self, buf: &mut Vec<u8>, len: usize) -> Result<()> {
         buf.resize(len, 0);
-
-        #[cfg(not(feature = "wasm"))]
         self.0.get_mut().read_exact(&mut buf[..]).await?;
-
-        #[cfg(feature = "wasm")]
-        self.0.read_exact(&mut buf[..])?;
 
         Ok(())
     }
 
     /// Shutdown stream
     pub async fn shutdown(&mut self) -> Result<()> {
-        #[cfg(not(feature = "wasm"))]
         self.0.get_mut().shutdown().await?;
-
-        #[cfg(feature = "wasm")]
-        self.0.shutdown(std::net::Shutdown::Both)?;
-
         Ok(())
     }
 
     /// Write to stream
     pub async fn write(&mut self, buf: &mut Vec<u8>) -> Result<()> {
-        #[cfg(not(feature = "wasm"))]
         self.0.get_mut().write_all(&buf[..]).await?;
-
-        #[cfg(feature = "wasm")]
-        self.0.write_all(&buf[..])?;
-
         buf.truncate(0);
         Ok(())
     }

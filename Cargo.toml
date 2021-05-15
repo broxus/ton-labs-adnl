@@ -23,7 +23,7 @@ serde_json = "1.0.41"
 sha2 = "0.9.5"
 socket2 = "0.3.19"
 stream-cancel = "0.8"
-tokio = { version = "1", features = ["io-util"] }
+tokio = { version = "1", features = ["io-util","net","rt","macros"] }
 tokio-stream = "0.1.5"
 tokio-io-timeout = "1.1.1"
 x25519-dalek = "1"
@@ -32,9 +32,5 @@ ton_api = { git = "https://github.com/broxus/ton-labs-tl.git", branch = "origina
 ton_types = { git = "https://github.com/tonlabs/ton-labs-types.git" }
 
 [features]
-default = ["multi-threaded"]
-multi-threaded = ["tokio/rt-multi-thread", "tokio/net"]
-single-threaded = ["tokio/rt", "tokio/net"]
-wasm = ["tokio/rt"]
 
 trace = []
