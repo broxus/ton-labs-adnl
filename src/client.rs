@@ -10,11 +10,7 @@ use std::{
     net::SocketAddr,
     time::{Duration, SystemTime},
 };
-use ton_api::ton::{
-    adnl::{Message as AdnlMessage, Pong as AdnlPongBoxed},
-    rpc::tcp::Ping as TcpPing,
-    TLObject,
-};
+use ton_api::ton::{adnl::Message as AdnlMessage, rpc::tcp::Ping as TcpPing, TLObject};
 
 use ton_types::{fail, Result};
 
@@ -102,10 +98,24 @@ impl AdnlClient {
         let now = SystemTime::now();
         let random_id = rand::thread_rng().gen();
         let query = TLObject::new(TcpPing { random_id });
-        let answer: AdnlPongBoxed = Query::parse(self.query(&query).await?, &query)?;
-        if answer.value() != &random_id {
+
+        let mut buf = serialize(&query)?;
+        self.crypto.send(&mut self.stream, &mut buf).await?;
+        loop {
+            self.crypto.receive(&mut buf, &mut self.stream).await?;
+            if !buf.is_empty() {
+                break;
+            }
+        }
+
+        let answer = deserialize(&buf[..])?
+            .downcast::<<TcpPing as ton_api::Function>::Reply>()
+            .map_err(|answer| failure::format_err!("Invalid ping response {:?}", answer))?;
+
+        if answer.random_id() != &random_id {
             fail!("Bad reply to TCP ping")
         }
+
         Ok(now.elapsed()?.as_secs())
     }
 
