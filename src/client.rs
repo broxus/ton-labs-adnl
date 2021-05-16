@@ -35,7 +35,8 @@ impl AdnlClientConfig {
         let json_config: AdnlClientConfigJson = serde_json::from_str(json)?;
         Self::from_json_config(json_config)
     }
-    /// Costructs new configuration from JSON data
+
+    /// Constructs new configuration from JSON data
     pub fn from_json_config(json_config: AdnlClientConfigJson) -> Result<Self> {
         let client_key = if let Some(key) = &json_config.client_key {
             Some(KeyOption::from_private_key(key)?)
@@ -71,20 +72,19 @@ impl AdnlClient {
     /// Connect to server
     pub async fn connect(config: &AdnlClientConfig) -> Result<Self> {
         let socket = socket2::Socket::new(
-            socket2::Domain::ipv4(),
-            socket2::Type::stream(),
-            Some(socket2::Protocol::tcp()),
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
         )?;
         socket.set_reuse_address(true)?;
         socket.set_linger(Some(Duration::from_secs(0)))?;
-        //socket.bind(&"0.0.0.0:0".parse::<SocketAddr>()?.into())?;
         socket.connect_timeout(
             &config.server_address.into(),
             config.timeouts.write().unwrap(),
         )?;
 
         let mut stream = AdnlStream::from_stream_with_timeouts(
-            tokio::net::TcpStream::from_std(socket.into_tcp_stream())?,
+            tokio::net::TcpStream::from_std(socket.into())?,
             config.timeouts(),
         );
         Ok(Self {
