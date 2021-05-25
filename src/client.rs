@@ -1,18 +1,14 @@
-use crate::{
-    common::{
-        deserialize, get256, serialize, AdnlHandshake, AdnlStream, AdnlStreamCrypto, KeyOption,
-        KeyOptionJson, Query, Timeouts, TARGET,
-    },
-    dump,
-};
-use rand::Rng;
-use std::{
-    net::SocketAddr,
-    time::{Duration, SystemTime},
-};
-use ton_api::ton::{adnl::Message as AdnlMessage, rpc::tcp::Ping as TcpPing, TLObject};
+use std::net::SocketAddr;
+use std::time::{Duration, SystemTime};
 
+use rand::Rng;
+use ton_api::ton::{adnl::Message as AdnlMessage, rpc::tcp::Ping as TcpPing, TLObject};
 use ton_types::{fail, Result};
+
+use crate::common::{
+    deserialize, get256, serialize, AdnlHandshake, AdnlStream, AdnlStreamCrypto, KeyOption,
+    KeyOptionJson, Query, Timeouts,
+};
 
 /// ADNL client configuration
 pub struct AdnlClientConfig {
@@ -159,7 +155,7 @@ impl AdnlClient {
             let mut rng = rand::thread_rng();
             let mut buf: Vec<u8> = (0..160).map(|_| rng.gen()).collect();
             let nonce = arrayref::array_ref!(buf, 0, 160);
-            dump!(trace, TARGET, "Nonce", nonce);
+
             let ret = AdnlStreamCrypto::with_nonce_as_client(nonce);
             if let Some(client_key) = &config.client_key {
                 AdnlHandshake::build_packet(&mut buf, client_key, &config.server_key)?

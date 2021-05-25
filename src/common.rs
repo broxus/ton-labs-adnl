@@ -1,52 +1,18 @@
+use std::fmt::{self, Debug, Display, Formatter};
+use std::hash::Hash;
 use std::ops::Range;
-use std::{
-    fmt::{self, Debug, Display, Formatter},
-    hash::Hash,
-    sync::Arc,
-    time::Duration,
-};
+use std::sync::Arc;
+use std::time::Duration;
 
 use cipher::{generic_array, NewCipher, StreamCipher};
 use ed25519::signature::{Signature, Verifier};
 use rand::Rng;
 use sha2::Digest;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use ton_api::{
-    ton::{
-        self,
-        adnl::{message::message::Query as AdnlQueryMessage, Message as AdnlMessage},
-        TLObject,
-    },
-    BoxedSerialize, Deserializer, IntoBoxed, Serializer,
-};
+use ton_api::ton::adnl::{message::message::Query as AdnlQueryMessage, Message as AdnlMessage};
+use ton_api::ton::{self, TLObject};
+use ton_api::{BoxedSerialize, Deserializer, IntoBoxed, Serializer};
 use ton_types::{fail, Result};
-
-pub(crate) const TARGET: &str = "adnl";
-
-#[macro_export]
-macro_rules! dump {
-    ($data: expr) => {{
-        let mut dump = String::new();
-        for i in 0..$data.len() {
-            dump.push_str(&format!(
-                "{:02x}{}",
-                $data[i],
-                if (i + 1) % 16 == 0 { '\n' } else { ' ' }
-            ))
-        }
-        dump
-    }};
-    (debug, $target:expr, $msg:expr, $data:expr) => {
-        if log::log_enabled!(log::Level::Debug) {
-            log::debug!(target: $target, "{}:\n{}", $msg, dump!($data))
-        }
-    };
-    (trace, $target:expr, $msg:expr, $data:expr) => {
-        if log::log_enabled!(log::Level::Trace) {
-            log::trace!(target: $target, "{}:\n{}", $msg, dump!($data))
-        }
-    };
-}
 
 #[macro_export]
 macro_rules! from_slice {
@@ -115,22 +81,6 @@ macro_rules! from_slice {
     };
 }
 
-#[macro_export]
-macro_rules! trace {
-    ($target:expr, $func:expr) => {{
-        if log::log_enabled!(log::Level::Debug) {
-            let msg = stringify!($func);
-            let pos = msg.find('\n').unwrap_or(80);
-            log::debug!(target: $target, "before {}...", &msg[..pos]);
-            let ret = $func;
-            log::debug!(target: $target, "after {}...", &msg[..pos]);
-            ret
-        } else {
-            $func
-        }
-    }};
-}
-
 /// ADNL crypto utils
 pub struct AdnlCryptoUtils;
 
@@ -191,7 +141,6 @@ impl AdnlHandshake {
 
         let mut shared_secret =
             AdnlCryptoUtils::calc_shared_secret(local.pvt_key()?, other.pub_key()?);
-        dump!(trace, TARGET, "Shared Secret", &shared_secret);
         Self::build_packet_cipher(&mut shared_secret, &checksum).apply_keystream(&mut buf[96..]);
         Ok(())
     }
@@ -201,8 +150,7 @@ impl AdnlHandshake {
         let y = &checksum[..];
         let mut aes_key_bytes = from_slice!(x, 0, 16, y, 16, 16);
         let mut aes_ctr_bytes = from_slice!(y, 0, 4, x, 20, 12);
-        dump!(trace, TARGET, "AES-Ctr Key (handshake)", &aes_key_bytes);
-        dump!(trace, TARGET, "AES-Ctr Counter (handshake)", &aes_ctr_bytes);
+
         shared_secret.iter_mut().for_each(|a| *a = 0);
         AdnlCryptoUtils::build_cipher_secure(&mut aes_key_bytes, &mut aes_ctr_bytes)
     }
