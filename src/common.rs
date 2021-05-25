@@ -1,8 +1,9 @@
+use std::convert::TryInto;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::hash::Hash;
 use std::ops::Range;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cipher::{generic_array, NewCipher, StreamCipher};
 use ed25519::signature::{Signature, Verifier};
@@ -16,13 +17,6 @@ use ton_types::{fail, Result};
 
 #[macro_export]
 macro_rules! from_slice {
-    ($x:ident, 32) => {
-        [
-            $x[0], $x[1], $x[2], $x[3], $x[4], $x[5], $x[6], $x[7], $x[8], $x[9], $x[10], $x[11],
-            $x[12], $x[13], $x[14], $x[15], $x[16], $x[17], $x[18], $x[19], $x[20], $x[21], $x[22],
-            $x[23], $x[24], $x[25], $x[26], $x[27], $x[28], $x[29], $x[30], $x[31],
-        ]
-    };
     ($x:ident, $ix:expr, 16, $y: ident, $iy:expr, 16) => {
         [
             $x[$ix + 0],
@@ -126,10 +120,10 @@ pub struct AdnlHandshake;
 impl AdnlHandshake {
     /// Build handshake packet
     pub fn build_packet(buf: &mut Vec<u8>, local: &KeyOption, other: &KeyOption) -> Result<()> {
-        let checksum = {
+        let checksum: [u8; 32] = {
             let checksum = sha2::Sha256::digest(&buf[..]);
             let checksum = checksum.as_slice();
-            from_slice!(checksum, 32)
+            checksum.try_into().unwrap()
         };
 
         let len = buf.len();
@@ -153,35 +147,6 @@ impl AdnlHandshake {
 
         shared_secret.iter_mut().for_each(|a| *a = 0);
         AdnlCryptoUtils::build_cipher_secure(&mut aes_key_bytes, &mut aes_ctr_bytes)
-    }
-}
-
-/// ADNL peers
-#[derive(Clone)]
-pub struct AdnlPeers(Arc<KeyId>, Arc<KeyId>);
-
-impl AdnlPeers {
-    /// Constructor
-    pub fn with_keys(local: Arc<KeyId>, other: Arc<KeyId>) -> Self {
-        Self(local, other)
-    }
-
-    /// Local peer
-    pub fn local(&self) -> &Arc<KeyId> {
-        let AdnlPeers(local, _) = self;
-        local
-    }
-
-    /// Other peer
-    pub fn other(&self) -> &Arc<KeyId> {
-        let AdnlPeers(_, other) = self;
-        other
-    }
-
-    /// Change other peer
-    pub fn set_other(&mut self, other: Arc<KeyId>) {
-        let AdnlPeers(_, old_other) = self;
-        *old_other = other
     }
 }
 
@@ -317,9 +282,9 @@ impl KeyOption {
         let pub_key = ed25519_dalek::PublicKey::from(&exp_key).to_bytes();
         let exp_key = &exp_key.to_bytes();
         let pvt_key = &exp_key[..32];
-        let pvt_key = from_slice!(pvt_key, 32);
+        let pvt_key = pvt_key.try_into().unwrap();
         let exp_key = &exp_key[32..];
-        let exp_key = from_slice!(exp_key, 32);
+        let exp_key = exp_key.try_into().unwrap();
         Self {
             id: Self::calc_id(Self::KEY_ED25519, &pub_key),
             keys: [Some(pub_key), Some(pvt_key), Some(exp_key)],
@@ -366,8 +331,7 @@ impl KeyOption {
         if key.len() != 32 {
             fail!("Bad public key");
         }
-        let key = &key[..32];
-        let pub_key = from_slice!(key, 32);
+        let pub_key: [u8; 32] = key[..32].try_into().unwrap();
         Ok(Self {
             id: Self::calc_id(src.type_id, &pub_key),
             keys: [Some(pub_key), None, None],
@@ -485,7 +449,7 @@ impl KeyOption {
         sha.update(pub_key);
         let buf = sha.finalize();
         let src = buf.as_slice();
-        KeyId::from_data(from_slice!(src, 32))
+        KeyId::from_data(src.try_into().unwrap())
     }
 }
 
@@ -523,10 +487,92 @@ impl Query {
             Err(answer) => fail!("Unsupported response to {:?}: {:?}", query, answer),
         }
     }
+
+    #[cfg(feature = "server")]
+    pub async fn process_adnl(
+        subscribers: &[Arc<dyn Subscriber>],
+        query: &AdnlQueryMessage,
+        peers: &AdnlPeers,
+    ) {
+    }
+
+    #[cfg(feature = "server")]
+    fn answer<A, F>(answer: Option<Answer>, convert: F) -> Result<(bool, Option<A>)>
+    where
+        F: Fn(Vec<u8>),
+    {
+        let answer = match answer {
+            Some(Answer::Object(x)) => Some(serialize(&x)?),
+            Some(Answer::Raw(x)) => Some(x),
+            None => None,
+        };
+        Ok((true, answer.map(convert)))
+    }
+
+    #[cfg(feature = "server")]
+    pub async fn process(
+        subscribers: &[Arc<dyn Subscriber>],
+        query: &[u8],
+        peers: &AdnlPeers,
+    ) -> Result<(bool, Option<Answer>)> {
+        let mut queries = deserialize_bundle(query)?;
+        if queries.len() == 1 {
+            let mut query = queries.remove(0);
+            for subscriber in subscribers.iter() {
+                query = match subscriber.try_consume_query(query, peers).await? {
+                    QueryResult::Consumed(answer) => return Ok((true, answer)),
+                    QueryResult::Rejected(query) => query,
+                    QueryResult::RejectedBundle(_) => unreachable!(),
+                };
+            }
+        } else {
+            for subscriber in subscribers.iter() {
+                queries = match subscriber.try_consume_query_bundle(queries, peers).await? {
+                    QueryResult::Consumed(answer) => return Ok((true, answer)),
+                    QueryResult::Rejected(_) => unreachable!(),
+                    QueryResult::RejectedBundle(queries) => queries,
+                };
+            }
+        }
+        Ok((false, None))
+    }
 }
 
 /// ADNL query ID
 pub type QueryId = [u8; 32];
+
+#[cfg(feature = "server")]
+pub enum QueryResult {
+    Consumed(Option<Answer>),
+    Rejected(TLObject),
+    RejectedBundle(Vec<TLObject>),
+}
+
+impl QueryResult {
+    pub fn consume<A: IntoBoxed>(answer: A) -> Result<Self>
+    where
+        <A as IntoBoxed>::Boxed: Send + Sync + serde::Serialize + 'static,
+    {
+        Ok(QueryResult::Consumed(Some(Answer::Object(TLObject::new(
+            answer.into_boxed(),
+        )))))
+    }
+
+    pub fn consume_boxed<A>(answer: A) -> Result<Self>
+    where
+        A: BoxedSerialize + Send + Sync + serde::Serialize + 'static,
+    {
+        Ok(QueryResult::Consumed(Some(Answer::Object(TLObject::new(
+            answer,
+        )))))
+    }
+}
+
+#[cfg(feature = "server")]
+pub enum Answer {
+    Object(TLObject),
+    Raw(Vec<u8>),
+}
 
 /// Network timeouts
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
@@ -553,6 +599,47 @@ impl Default for Timeouts {
             read: Self::DEFAULT_TIMEOUT,
             write: Self::DEFAULT_TIMEOUT,
         }
+    }
+}
+
+#[derive(Clone)]
+pub struct AdnlPeers {
+    local: Arc<KeyId>,
+    other: Arc<KeyId>,
+}
+
+impl AdnlPeers {
+    /// Constructor
+    pub fn with_keys(local: Arc<KeyId>, other: Arc<KeyId>) -> Self {
+        Self { local, other }
+    }
+
+    /// Local peer
+    pub fn local(&self) -> &Arc<KeyId> {
+        &self.local
+    }
+
+    /// Other peer
+    pub fn other(&self) -> &Arc<KeyId> {
+        &self.other
+    }
+}
+
+#[cfg(feature = "server")]
+#[async_trait::async_trait]
+pub trait Subscriber: Send + Sync {
+    async fn poll(&self, _start: &Arc<Instant>) {}
+
+    async fn try_consume_query(&self, object: TLObject, _peers: &AdnlPeers) -> Result<QueryResult> {
+        Ok(QueryResult::Rejected(object))
+    }
+
+    async fn try_consume_query_bundle(
+        &self,
+        objects: Vec<TLObject>,
+        _peers: &AdnlPeers,
+    ) -> Result<QueryResult> {
+        Ok(QueryResult::RejectedBundle(objects))
     }
 }
 
@@ -598,7 +685,7 @@ pub fn hash_boxed<T: BoxedSerialize>(object: &T) -> Result<[u8; 32]> {
     let data = serialize(object)?;
     let buf = sha2::Sha256::digest(&data[..]);
     let hash = buf.as_slice();
-    Ok(from_slice!(hash, 32))
+    Ok(hash.try_into().unwrap())
 }
 
 /// Serialize TL object into bytes
@@ -618,4 +705,11 @@ pub fn serialize_append<T: BoxedSerialize>(buf: &mut Vec<u8>, object: &T) -> Res
 pub fn serialize_inplace<T: BoxedSerialize>(buf: &mut Vec<u8>, object: &T) -> Result<()> {
     buf.truncate(0);
     serialize_append(buf, object)
+}
+
+pub fn now() -> i32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i32
 }

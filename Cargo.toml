@@ -6,12 +6,15 @@ description = "ADNL library"
 
 [dependencies]
 aes = { version = "0.7", features = ["ctr"] }
-cipher = "0.3"
 arrayref = "0.3"
+async-trait = { version = "0.1", optional = true }
 base64 = "0.13"
 curve25519-dalek = "3.0"
+cipher = "0.3"
+dashmap = { version = "4.0", optional = true }
 ed25519 = "1.0"
 ed25519-dalek = "1.0"
+external-ip = { version = "4.1", optional = true }
 failure = "0.1"
 log = "0.4"
 rand = "0.7"
@@ -30,4 +33,4 @@ ton_types = { git = "https://github.com/tonlabs/ton-labs-types.git" }
 default = ["client"]
 trace = []
 client = []
-server = ["ton_api/ton_api"]
+server = ["ton_api/ton_api", "dashmap", "external-ip", "async-trait"]
