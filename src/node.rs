@@ -26,11 +26,11 @@ use ton_api::ton::adnl::Message as AdnlMessage;
 use ton_api::ton::adnl::PacketContents as AdnlPacketContents;
 use ton_api::ton::pub_::publickey::Aes as AesKey;
 use ton_api::ton::rpc::adnl::Ping as AdnlPing;
+use ton_api::ton::TLObject;
 use ton_api::{ton, IntoBoxed};
 use ton_types::{fail, Result};
 
 use crate::common::*;
-use ton_api::ton::TLObject;
 
 pub struct AdnlNode {
     config: AdnlNodeConfig,
@@ -56,6 +56,7 @@ impl AdnlNode {
     const TIMEOUT_ADDRESS: i32 = 1000; // Seconds
     const TIMEOUT_CHANNEL_RESET: u32 = 30; // Seconds
     const TIMEOUT_QUERY_MAX: u64 = 5000; // Milliseconds
+    const TIMEOUT_QUERY_MIN: u64 = 500; // Milliseconds
     const TIMEOUT_TRANSFER: u64 = 3; // Seconds
     const TIMEOUT_QUERY_STOP: u64 = 1; // Milliseconds
     const TIMEOUT_SHUTDOWN: u64 = 2000; // Milliseconds
@@ -435,6 +436,15 @@ impl AdnlNode {
             priority: 0,
             expire_at: expire_at.unwrap_or_default(),
         })
+    }
+
+    pub fn calc_timeout(roundtrip: Option<u64>) -> u64 {
+        let timeout = roundtrip.unwrap_or(Self::TIMEOUT_QUERY_MAX);
+        if timeout < Self::TIMEOUT_QUERY_MIN {
+            Self::TIMEOUT_QUERY_MIN
+        } else {
+            timeout
+        }
     }
 
     pub fn add_peer(
@@ -1256,6 +1266,23 @@ pub struct AdnlNodeConfig {
 }
 
 impl AdnlNodeConfig {
+    /// Construct from IP address and key data
+    pub fn from_ip_address_and_keys(
+        ip_address: SocketAddr,
+        keys: Vec<(KeyOption, usize)>,
+    ) -> Result<Self> {
+        let ret = AdnlNodeConfig {
+            ip_address: IpAddress::from_socket_address(ip_address)?,
+            keys: DashMap::new(),
+            tags: DashMap::new(),
+            throughput: None,
+        };
+        for (key, tag) in keys {
+            ret.add_key(key, tag)?;
+        }
+        Ok(ret)
+    }
+
     pub fn ip_address(&self) -> IpAddress {
         self.ip_address
     }
@@ -1616,7 +1643,10 @@ pub struct IpAddress(u64);
 
 impl IpAddress {
     pub fn from_string(str: &str) -> Result<Self> {
-        let addr = str.parse::<SocketAddr>()?;
+        Self::from_socket_address(str.parse::<SocketAddr>()?)
+    }
+
+    pub fn from_socket_address(addr: SocketAddr) -> Result<Self> {
         if let IpAddr::V4(ip) = addr.ip() {
             Ok(Self::from_ip_and_port(
                 u32::from_be_bytes(ip.octets()),

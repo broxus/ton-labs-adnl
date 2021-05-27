@@ -4,7 +4,7 @@ use std::hash::Hash;
 use std::mem::MaybeUninit;
 use std::ops::Range;
 #[cfg(feature = "node")]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 #[cfg(feature = "node")]
@@ -16,6 +16,8 @@ use rand::Rng;
 use sha2::Digest;
 #[cfg(feature = "client")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(feature = "node")]
+use tokio::sync::mpsc;
 #[cfg(feature = "node")]
 use ton_api::ton::adnl::message::message::Answer as AdnlAnswerMessage;
 #[cfg(feature = "node")]
@@ -358,7 +360,7 @@ pub struct KeyOption {
     type_id: i32,
 }
 
-#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 pub struct KeyOptionJson {
     type_id: i32,
     pub_key: Option<String>,
@@ -806,6 +808,68 @@ impl UpdatedAt {
 
     pub fn is_expired(&self, timeout: u64) -> bool {
         self.started.elapsed().as_secs() - self.updated.load(Ordering::Acquire) >= timeout
+    }
+}
+
+#[cfg(feature = "node")]
+pub struct Wait<T> {
+    count: AtomicUsize,
+    queue_sender: mpsc::UnboundedSender<Option<T>>,
+}
+
+#[cfg(feature = "node")]
+impl<T> Wait<T> {
+    pub fn new() -> (Arc<Self>, mpsc::UnboundedReceiver<Option<T>>) {
+        let (queue_sender, queue_reader) = mpsc::unbounded_channel();
+        (
+            Arc::new(Self {
+                count: AtomicUsize::new(0),
+                queue_sender,
+            }),
+            queue_reader,
+        )
+    }
+
+    pub fn count(&self) -> usize {
+        self.count.load(Ordering::Acquire)
+    }
+
+    pub fn request(&self) -> usize {
+        self.count.fetch_add(1, Ordering::Acquire)
+    }
+
+    pub fn respond(&self, val: Option<T>) {
+        match self.queue_sender.send(val) {
+            Ok(()) => (),
+            Err(mpsc::error::SendError(_)) => (),
+        }
+    }
+
+    pub async fn wait(
+        &self,
+        queue_reader: &mut mpsc::UnboundedReceiver<Option<T>>,
+        only_one: bool,
+    ) -> Option<Option<T>> {
+        let mut empty = self.count.load(Ordering::Acquire) == 0;
+        let mut ret = None;
+        if !empty {
+            ret = queue_reader.recv().await;
+            match ret {
+                Some(ref item) => {
+                    self.count.fetch_sub(1, Ordering::Release);
+                    if item.is_some() && only_one {
+                        empty = true
+                    }
+                }
+                None => empty = true,
+            }
+        }
+        if empty {
+            // Graceful close
+            queue_reader.close();
+            while queue_reader.recv().await.is_some() {}
+        }
+        ret
     }
 }
 
