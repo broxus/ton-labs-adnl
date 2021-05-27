@@ -16,6 +16,7 @@ use ton_api::ton::adnl::id::short::Short as AdnlIdShort;
 use ton_api::ton::adnl::message::message::Answer as AdnlAnswerMessage;
 use ton_api::ton::adnl::message::message::ConfirmChannel as ConfirmChannelMessage;
 use ton_api::ton::adnl::message::message::CreateChannel as CreateChannelMessage;
+use ton_api::ton::adnl::message::message::Custom as AdnlCustomMessage;
 use ton_api::ton::adnl::message::message::Part as AdnlPartMessage;
 use ton_api::ton::adnl::message::message::Query as AdnlQueryMessage;
 use ton_api::ton::adnl::packetcontents::PacketContents;
@@ -651,6 +652,14 @@ impl AdnlNode {
         } else {
             fail!("No subscribers for query {:?}", query)
         }
+    }
+
+    pub async fn send_custom(&self, data: &[u8], peers: &AdnlPeers) -> Result<()> {
+        let msg = AdnlCustomMessage {
+            data: ton::bytes(data.to_vec()),
+        }
+        .into_boxed();
+        self.send_message(msg, peers)
     }
 
     async fn check_packet(
