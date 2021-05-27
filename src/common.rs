@@ -3,19 +3,26 @@ use std::fmt::{self, Debug, Display, Formatter};
 use std::hash::Hash;
 use std::mem::MaybeUninit;
 use std::ops::Range;
+#[cfg(feature = "node")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(feature = "node")]
+use std::time::Instant;
 
 use cipher::{generic_array, NewCipher, StreamCipher};
 use ed25519::signature::{Signature, Verifier};
 use rand::Rng;
 use sha2::Digest;
+#[cfg(feature = "client")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(feature = "node")]
 use ton_api::ton::adnl::message::message::Answer as AdnlAnswerMessage;
+#[cfg(feature = "node")]
 use ton_api::ton::adnl::message::message::Custom as AdnlCustomMessage;
 use ton_api::ton::adnl::message::message::Query as AdnlQueryMessage;
 use ton_api::ton::adnl::Message as AdnlMessage;
+#[cfg(feature = "node")]
 use ton_api::ton::rldp::message::{Answer as RldpAnswer, Query as RldpQuery};
 use ton_api::ton::{self, TLObject};
 use ton_api::{BoxedSerialize, Deserializer, IntoBoxed, Serializer};
@@ -229,11 +236,14 @@ impl<'a> PacketView<'a> {
     }
 }
 
+#[cfg(feature = "client")]
 type AdnlStreamInner = tokio_io_timeout::TimeoutStream<tokio::net::TcpStream>;
 
 /// ADNL TCP stream
+#[cfg(feature = "client")]
 pub struct AdnlStream(AdnlStreamInner);
 
+#[cfg(feature = "client")]
 impl AdnlStream {
     /// Constructor
     pub fn from_stream_with_timeouts(stream: tokio::net::TcpStream, timeouts: &Timeouts) -> Self {
@@ -266,11 +276,13 @@ impl AdnlStream {
 }
 
 /// ADNL stream cryptographic context
+#[cfg(feature = "client")]
 pub struct AdnlStreamCrypto {
     cipher_recv: aes::Aes256Ctr,
     cipher_send: aes::Aes256Ctr,
 }
 
+#[cfg(feature = "client")]
 impl AdnlStreamCrypto {
     /// Construct as client
     pub fn with_nonce_as_client(nonce: &[u8; 160]) -> Self {
@@ -710,6 +722,7 @@ pub enum QueryResult {
     RejectedBundle(Vec<TLObject>),
 }
 
+#[cfg(feature = "node")]
 impl QueryResult {
     pub fn consume<A: IntoBoxed>(answer: A) -> Result<Self>
     where
@@ -770,12 +783,14 @@ pub struct UpdatedAt {
     updated: AtomicU64,
 }
 
+#[cfg(feature = "node")]
 impl Default for UpdatedAt {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "node")]
 impl UpdatedAt {
     pub fn new() -> Self {
         Self {
