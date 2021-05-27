@@ -33,4 +33,4 @@ ton_types = { git = "https://github.com/tonlabs/ton-labs-types.git" }
 default = ["client"]
 trace = []
 client = []
-server = ["ton_api/ton_api", "dashmap", "external-ip", "async-trait"]
+node = ["ton_api/ton_api", "dashmap", "external-ip", "async-trait"]

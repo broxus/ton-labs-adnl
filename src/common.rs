@@ -2,6 +2,7 @@ use std::convert::TryInto;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::hash::Hash;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -10,7 +11,11 @@ use ed25519::signature::{Signature, Verifier};
 use rand::Rng;
 use sha2::Digest;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use ton_api::ton::adnl::{message::message::Query as AdnlQueryMessage, Message as AdnlMessage};
+use ton_api::ton::adnl::message::message::{
+    Answer as AdnlAnswerMessage, Custom as AdnlCustomMessage, Query as AdnlQueryMessage,
+};
+use ton_api::ton::adnl::Message as AdnlMessage;
+use ton_api::ton::rldp::message::{Answer as RldpAnswer, Query as RldpQuery};
 use ton_api::ton::{self, TLObject};
 use ton_api::{BoxedSerialize, Deserializer, IntoBoxed, Serializer};
 use ton_types::{fail, Result};
@@ -147,6 +152,46 @@ impl AdnlHandshake {
 
         shared_secret.iter_mut().for_each(|a| *a = 0);
         AdnlCryptoUtils::build_cipher_secure(&mut aes_key_bytes, &mut aes_ctr_bytes)
+    }
+
+    #[cfg(feature = "node")]
+    pub fn parse_packet(
+        keys: &dashmap::DashMap<Arc<KeyId>, Arc<KeyOption>>,
+        buffer: &mut Vec<u8>,
+        length: Option<usize>,
+    ) -> Result<Option<Arc<KeyId>>> {
+        if buffer.len() < 96 + length.unwrap_or_default() {
+            fail!("Bad handshake packet length: {}", buffer.len());
+        }
+
+        let range = match length {
+            Some(length) => 96..96 + length,
+            None => 96..buffer.len(),
+        };
+
+        for key in keys.iter() {
+            if key.value().id().data().eq(&buffer[0..32]) {
+                let mut shared_secret = AdnlCryptoUtils::calc_shared_secret(
+                    key.value().pvt_key()?,
+                    arrayref::array_ref!(buffer, 32, 32),
+                );
+
+                Self::build_packet_cipher(&mut shared_secret, arrayref::array_ref!(buffer, 64, 32))
+                    .apply_keystream(&mut buffer[range]);
+
+                if !sha2::Sha256::digest(&buffer[96..])
+                    .as_slice()
+                    .eq(&buffer[64..96])
+                {
+                    fail!("Bad handshake packet checksum");
+                }
+
+                buffer.drain(0..96);
+                return Ok(Some(key.key().clone()));
+            }
+        }
+
+        Ok(None)
     }
 }
 
@@ -416,6 +461,29 @@ impl KeyOption {
         self.type_id
     }
 
+    #[cfg(feature = "node")]
+    pub fn from_tl_public_key(src: &ton::PublicKey) -> Result<Self> {
+        if let ton::PublicKey::Pub_Ed25519(key) = src {
+            Ok(Self::from_type_and_public_key(
+                Self::KEY_ED25519,
+                &key.key.0,
+            ))
+        } else {
+            fail!("Unsupported public key type {:?}", src)
+        }
+    }
+
+    #[cfg(feature = "node")]
+    pub fn as_tl_public_key(&self) -> Result<ton::PublicKey> {
+        if self.type_id != Self::KEY_ED25519 {
+            fail!("Export is supported only for Ed25519 keys")
+        }
+        Ok(ton::pub_::publickey::Ed25519 {
+            key: ton::int256(*self.pub_key()?),
+        }
+        .into_boxed())
+    }
+
     /// Generate signature
     pub fn sign(&self, data: &[u8]) -> Result<[u8; 64]> {
         if self.type_id != Self::KEY_ED25519 {
@@ -454,10 +522,26 @@ impl KeyOption {
 }
 
 /// ADNL/RLDP Query
+#[cfg(not(feature = "node"))]
 #[derive(Debug)]
 pub struct Query;
 
+#[cfg(feature = "node")]
+#[derive(Debug)]
+pub enum Query {
+    Received(Vec<u8>),
+    Sent(Arc<tokio::sync::Barrier>),
+    Timeout,
+}
+
 impl Query {
+    #[cfg(feature = "node")]
+    pub fn new() -> (Arc<tokio::sync::Barrier>, Self) {
+        let ping = Arc::new(tokio::sync::Barrier::new(2));
+        let pong = ping.clone();
+        (ping, Query::Sent(pong))
+    }
+
     /// Build query
     pub fn build(prefix: Option<&[u8]>, query: &TLObject) -> Result<(QueryId, AdnlMessage)> {
         let query_id: QueryId = rand::thread_rng().gen();
@@ -488,18 +572,59 @@ impl Query {
         }
     }
 
-    #[cfg(feature = "server")]
+    #[cfg(feature = "node")]
     pub async fn process_adnl(
         subscribers: &[Arc<dyn Subscriber>],
         query: &AdnlQueryMessage,
         peers: &AdnlPeers,
-    ) {
+    ) -> Result<(bool, Option<AdnlMessage>)> {
+        if let (true, answer) = Self::process(subscribers, query.query.as_ref(), peers).await? {
+            Self::answer(answer, |answer| {
+                AdnlAnswerMessage {
+                    query_id: query.query_id,
+                    answer: ton::bytes(answer),
+                }
+                .into_boxed()
+            })
+        } else {
+            Ok((false, None))
+        }
     }
 
-    #[cfg(feature = "server")]
+    #[cfg(feature = "node")]
+    pub async fn process_custom(
+        subscribers: &[Arc<dyn Subscriber>],
+        custom: &AdnlCustomMessage,
+        peers: &AdnlPeers,
+    ) -> Result<bool> {
+        for subscriber in subscribers.iter() {
+            if subscriber.try_consume_custom(&custom.data, peers).await? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    #[cfg(feature = "node")]
+    pub async fn process_rldp(
+        subscribers: &[Arc<dyn Subscriber>],
+        query: &RldpQuery,
+        peers: &AdnlPeers,
+    ) -> Result<(bool, Option<RldpAnswer>)> {
+        if let (true, answer) = Self::process(subscribers, query.data.as_ref(), peers).await? {
+            Self::answer(answer, |answer| RldpAnswer {
+                query_id: query.query_id,
+                data: ton::bytes(answer),
+            })
+        } else {
+            Ok((false, None))
+        }
+    }
+
+    #[cfg(feature = "node")]
     fn answer<A, F>(answer: Option<Answer>, convert: F) -> Result<(bool, Option<A>)>
     where
-        F: Fn(Vec<u8>),
+        F: Fn(Vec<u8>) -> A,
     {
         let answer = match answer {
             Some(Answer::Object(x)) => Some(serialize(&x)?),
@@ -509,7 +634,7 @@ impl Query {
         Ok((true, answer.map(convert)))
     }
 
-    #[cfg(feature = "server")]
+    #[cfg(feature = "node")]
     pub async fn process(
         subscribers: &[Arc<dyn Subscriber>],
         query: &[u8],
@@ -538,10 +663,13 @@ impl Query {
     }
 }
 
+#[cfg(feature = "node")]
+pub type QueryCache = dashmap::DashMap<QueryId, Query>;
+
 /// ADNL query ID
 pub type QueryId = [u8; 32];
 
-#[cfg(feature = "server")]
+#[cfg(feature = "node")]
 pub enum QueryResult {
     Consumed(Option<Answer>),
     Rejected(TLObject),
@@ -568,7 +696,7 @@ impl QueryResult {
     }
 }
 
-#[cfg(feature = "server")]
+#[cfg(feature = "node")]
 pub enum Answer {
     Object(TLObject),
     Raw(Vec<u8>),
@@ -602,6 +730,36 @@ impl Default for Timeouts {
     }
 }
 
+#[cfg(feature = "node")]
+pub struct UpdatedAt {
+    started: Instant,
+    updated: AtomicU64,
+}
+
+impl Default for UpdatedAt {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl UpdatedAt {
+    pub fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            updated: AtomicU64::new(0),
+        }
+    }
+
+    pub fn refresh(&self) {
+        self.updated
+            .store(self.started.elapsed().as_secs(), Ordering::Release)
+    }
+
+    pub fn is_expired(&self, timeout: u64) -> bool {
+        self.started.elapsed().as_secs() - self.updated.load(Ordering::Acquire) >= timeout
+    }
+}
+
 #[derive(Clone)]
 pub struct AdnlPeers {
     local: Arc<KeyId>,
@@ -625,10 +783,14 @@ impl AdnlPeers {
     }
 }
 
-#[cfg(feature = "server")]
+#[cfg(feature = "node")]
 #[async_trait::async_trait]
 pub trait Subscriber: Send + Sync {
     async fn poll(&self, _start: &Arc<Instant>) {}
+
+    async fn try_consume_custom(&self, _data: &[u8], _peers: &AdnlPeers) -> Result<bool> {
+        Ok(false)
+    }
 
     async fn try_consume_query(&self, object: TLObject, _peers: &AdnlPeers) -> Result<QueryResult> {
         Ok(QueryResult::Rejected(object))
