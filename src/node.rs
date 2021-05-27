@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aes::cipher::StreamCipher;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use sha2::Digest;
 use socket2::{Domain, Socket};
 use tokio::sync::mpsc;
@@ -54,6 +54,8 @@ impl AdnlNode {
     const CLOCK_TOLERANCE: i32 = 60; // Seconds
 
     const TIMEOUT_ADDRESS: i32 = 1000; // Seconds
+    const TIMEOUT_CHANNEL_RESET: u32 = 30; // Seconds
+    const TIMEOUT_QUERY_MAX: u64 = 5000; // Milliseconds
     const TIMEOUT_TRANSFER: u64 = 3; // Seconds
     const TIMEOUT_QUERY_STOP: u64 = 1; // Milliseconds
     const TIMEOUT_SHUTDOWN: u64 = 2000; // Milliseconds
@@ -256,11 +258,11 @@ impl AdnlNode {
                             if let Err(e) = node.receive(buffer_view, &subscribers).await {
                                 log::warn!("ERROR <-- {}", e)
                             }
-                            proc_load.fetch_sub(1, atomic::Ordering::Relaxed);
+                            proc_load.fetch_sub(1, atomic::Ordering::Release);
                         }
                     });
                 }
-                node.stop.fetch_add(1, atomic::Ordering::Relaxed);
+                node.stop.fetch_add(1, atomic::Ordering::Release);
                 log::warn!("Node socket receiver exited");
             }
         });
@@ -654,6 +656,155 @@ impl AdnlNode {
         }
     }
 
+    /// Send query
+    pub async fn query(
+        &self,
+        query: &TLObject,
+        peers: &AdnlPeers,
+        timeout: Option<u64>,
+    ) -> Result<Option<TLObject>> {
+        self.query_with_prefix(None, query, peers, timeout).await
+    }
+
+    /// Send query with prefix
+    pub async fn query_with_prefix(
+        &self,
+        prefix: Option<&[u8]>,
+        query: &TLObject,
+        peers: &AdnlPeers,
+        timeout: Option<u64>,
+    ) -> Result<Option<TLObject>> {
+        let (query_id, msg) = Query::build(prefix, query)?;
+        let (ping, query) = Query::new();
+        self.queries.insert(query_id, query);
+        log::info!(
+            "Sent query {:02x}{:02x}{:02x}{:02x}",
+            query_id[0],
+            query_id[1],
+            query_id[2],
+            query_id[3]
+        );
+        let channel = if peers.local() == peers.other() {
+            self.queue_local_sender.send((msg, peers.local().clone()))?;
+            None
+        } else {
+            let channel = self.channels_send.get(peers.other());
+            self.send_message(msg, peers)?;
+            channel
+        };
+        let queries = self.queries.clone();
+        tokio::spawn(async move {
+            let timeout = timeout.unwrap_or(Self::TIMEOUT_QUERY_MAX);
+            log::info!(
+                "Scheduling drop for query {:02x}{:02x}{:02x}{:02x} in {} ms",
+                query_id[0],
+                query_id[1],
+                query_id[2],
+                query_id[3],
+                timeout
+            );
+            tokio::time::sleep(Duration::from_millis(timeout)).await;
+            log::info!(
+                "Try dropping query {:02x}{:02x}{:02x}{:02x}",
+                query_id[0],
+                query_id[1],
+                query_id[2],
+                query_id[3]
+            );
+            match Self::update_query(&queries, query_id, None).await {
+                Err(e) => log::info!(
+                    "ERROR: {} when dropping query {:02x}{:02x}{:02x}{:02x}",
+                    e,
+                    query_id[0],
+                    query_id[1],
+                    query_id[2],
+                    query_id[3]
+                ),
+                Ok(true) => log::info!(
+                    "Dropped query {:02x}{:02x}{:02x}{:02x}",
+                    query_id[0],
+                    query_id[1],
+                    query_id[2],
+                    query_id[3]
+                ),
+                _ => (),
+            }
+        });
+        ping.wait().await;
+        log::info!(
+            "Finished query {:02x}{:02x}{:02x}{:02x}",
+            query_id[0],
+            query_id[1],
+            query_id[2],
+            query_id[3]
+        );
+        if let Some((_, removed)) = self.queries.remove(&query_id) {
+            match removed {
+                Query::Received(answer) => return Ok(Some(deserialize(&answer)?)),
+                Query::Timeout => {
+                    /* Monitor channel health */
+                    if let Some(channel) = channel {
+                        let now = now() as u32;
+                        let was = channel
+                            .value()
+                            .drop
+                            .compare_exchange(
+                                0,
+                                now + Self::TIMEOUT_CHANNEL_RESET,
+                                atomic::Ordering::Acquire,
+                                atomic::Ordering::Relaxed,
+                            )
+                            .unwrap_or_else(|was| was);
+                        if (was > 0) && (was < now) {
+                            self.reset_peers(peers)?
+                        }
+                    }
+                    return Ok(None);
+                }
+                _ => (),
+            }
+        }
+        fail!("INTERNAL ERROR: ADNL query mismatch")
+    }
+
+    /// Reset peers
+    pub fn reset_peers(&self, peers: &AdnlPeers) -> Result<()> {
+        let peer_list = self.peers(peers.local())?;
+        let peer = peer_list.get(peers.other()).ok_or_else(|| {
+            ton_types::error!(
+                "Try to reset unknown peer pair {} -> {}",
+                peers.local(),
+                peers.other()
+            )
+        })?;
+        log::warn!("Resetting peer pair {} -> {}", peers.local(), peers.other());
+        let peer = peer.value();
+        let address = AdnlNodeAddress::from_ip_address_and_key(
+            IpAddress(peer.address.ip_address.load(atomic::Ordering::Acquire)),
+            peer.address.key.clone(),
+        )?;
+        self.channels_wait
+            .remove(peers.other())
+            .or_else(|| self.channels_send.remove(peers.other()))
+            .and_then(|(_, removed)| {
+                peer_list.insert(
+                    peers.other().clone(),
+                    Peer {
+                        address,
+                        receiver_state: PeerState::for_receive_with_reinit_date(
+                            peer.receiver_state
+                                .reinit_date
+                                .load(atomic::Ordering::Acquire)
+                                + 1,
+                        ),
+                        sender_state: PeerState::for_send(),
+                    },
+                );
+                self.channels_receive.remove(removed.receive_id())
+            });
+        Ok(())
+    }
+
     pub async fn send_custom(&self, data: &[u8], peers: &AdnlPeers) -> Result<()> {
         let msg = AdnlCustomMessage {
             data: ton::bytes(data.to_vec()),
@@ -835,6 +986,7 @@ impl AdnlNode {
                 self.channels_send.insert(key, removed);
             }
 
+            channel.drop.store(0, atomic::Ordering::Release);
             (channel.local_key.clone(), Some(channel.other_key.clone()))
         } else {
             log::trace!(
@@ -1194,10 +1346,176 @@ impl AdnlNodeAddress {
         })
     }
 }
+/// ADNL addresses cache iterator
+#[derive(Debug)]
+pub struct AddressCacheIterator(u32);
+
+/// ADNL addresses cache
+pub struct AddressCache {
+    cache: DashMap<Arc<KeyId>, u32>,
+    index: DashMap<u32, Arc<KeyId>>,
+    limit: u32,
+    upper: AtomicU32,
+}
+
+impl AddressCache {
+    pub fn with_limit(limit: u32) -> Self {
+        Self {
+            cache: DashMap::new(),
+            index: DashMap::new(),
+            limit,
+            upper: AtomicU32::new(0),
+        }
+    }
+
+    pub fn contains(&self, address: &Arc<KeyId>) -> bool {
+        self.cache.get(address).is_some()
+    }
+
+    pub fn count(&self) -> u32 {
+        std::cmp::min(self.upper.load(atomic::Ordering::Acquire), self.limit)
+    }
+
+    pub fn first(&self) -> (AddressCacheIterator, Option<Arc<KeyId>>) {
+        (AddressCacheIterator(0), self.find_by_index(0))
+    }
+
+    pub fn given(&self, iter: &AddressCacheIterator) -> Option<Arc<KeyId>> {
+        let AddressCacheIterator(ref index) = iter;
+        self.find_by_index(*index)
+    }
+
+    pub fn next(&self, iter: &mut AddressCacheIterator) -> Option<Arc<KeyId>> {
+        let AddressCacheIterator(ref mut index) = iter;
+        loop {
+            let ret = self.find_by_index({
+                *index += 1;
+                *index
+            });
+            if ret.is_some() {
+                return ret;
+            }
+            let limit = self.upper.load(atomic::Ordering::Acquire);
+            if *index >= std::cmp::min(limit, self.limit) {
+                return None;
+            }
+        }
+    }
+
+    pub fn put(&self, address: Arc<KeyId>) -> Result<bool> {
+        use dashmap::mapref::entry::Entry;
+
+        Ok(match self.cache.entry(address.clone()) {
+            Entry::Vacant(entry) => {
+                let upper = self.upper.fetch_add(1, atomic::Ordering::Acquire);
+                let mut index = upper;
+                if index >= self.limit {
+                    if index >= self.limit * 2 {
+                        self.upper
+                            .compare_exchange(
+                                upper + 1,
+                                index - self.limit + 1,
+                                atomic::Ordering::Release,
+                                atomic::Ordering::Relaxed,
+                            )
+                            .ok();
+                    }
+                    index %= self.limit;
+                }
+                entry.insert(index);
+                if let Some(key) = self.index.insert(index, address) {
+                    self.cache
+                        .remove_if(&key, |_, &old_index| old_index == index);
+                }
+                true
+            }
+            Entry::Occupied(_) => false,
+        })
+    }
+
+    pub fn random_set(
+        &self,
+        dst: &AddressCache,
+        skip: Option<&DashSet<Arc<KeyId>>>,
+        n: u32,
+    ) -> Result<()> {
+        let mut n = std::cmp::min(self.count(), n);
+        while n > 0 {
+            if let Some(key_id) = self.random(skip) {
+                // We do not check success of put due to multithreading
+                dst.put(key_id)?;
+                n -= 1;
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn random_vec(&self, skip: Option<&Arc<KeyId>>, n: u32) -> Vec<Arc<KeyId>> {
+        use rand::Rng;
+
+        let max = self.count();
+        let mut ret = Vec::new();
+        let mut check = false;
+        let mut i = std::cmp::min(max, n);
+        while i > 0 {
+            if let Some(key_id) = self.index.get(&rand::thread_rng().gen_range(0, max)) {
+                let key_id = key_id.value();
+                if let Some(skip) = skip {
+                    if skip == key_id {
+                        // If there are not enough items in cache,
+                        // reduce limit for skipped element
+                        if (n >= max) && !check {
+                            check = true;
+                            i -= 1;
+                        }
+                        continue;
+                    }
+                }
+                if ret.contains(key_id) {
+                    continue;
+                } else {
+                    ret.push(key_id.clone());
+                    i -= 1;
+                }
+            }
+        }
+        ret
+    }
+
+    fn find_by_index(&self, index: u32) -> Option<Arc<KeyId>> {
+        self.index
+            .get(&index)
+            .map(|address| address.value().clone())
+    }
+
+    fn random(&self, skip: Option<&DashSet<Arc<KeyId>>>) -> Option<Arc<KeyId>> {
+        use rand::Rng;
+
+        let max = self.count();
+        // We need a finite loop here because we can test skip set only on case-by-case basis
+        // due to multithreading. So it is possible that all items shall be skipped, and with
+        // infinite loop we will simply hang
+        for _ in 0..10 {
+            if let Some(ret) = self.index.get(&rand::thread_rng().gen_range(0, max)) {
+                let ret = ret.value();
+                if let Some(skip) = skip {
+                    if skip.contains(ret) {
+                        continue;
+                    }
+                }
+                return Some(ret.clone());
+            }
+        }
+        None
+    }
+}
 
 struct AdnlChannel {
     local_key: Arc<KeyId>,
     other_key: Arc<KeyId>,
+    drop: AtomicU32,
     receive_channel: ChannelSide,
     send_channel: ChannelSide,
 }
@@ -1229,6 +1547,7 @@ impl AdnlChannel {
         Ok(Self {
             local_key: local_key.clone(),
             other_key: other_key.clone(),
+            drop: Default::default(),
             receive_channel: ChannelSide::from_secret(forward_secret)?,
             send_channel: ChannelSide::from_secret(reversed_secret)?,
         })
@@ -1398,11 +1717,17 @@ pub struct PeerHistory {
     seqno: AtomicU64,
 }
 
+impl Default for PeerHistory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PeerHistory {
     const INDEX_MASK: u64 = HISTORY_BITS as u64 / 2 - 1;
     const IN_TRANSIT: u64 = 0xFFFFFFFFFFFFFFFF;
 
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             index: AtomicU64::new(0),
             masks: Default::default(),
@@ -1517,7 +1842,7 @@ impl PeerHistory {
                     }
                 } else {
                     for i in 0..HISTORY_CELLS {
-                        self.masks[i].store(0, atomic::Ordering::Relaxed)
+                        self.masks[i].store(0, atomic::Ordering::Release)
                     }
                 }
 
@@ -1633,7 +1958,7 @@ impl PeerState {
 
     fn reset_reinit_date(&self, reinit_date: i32) {
         self.reinit_date
-            .store(reinit_date, atomic::Ordering::Relaxed)
+            .store(reinit_date, atomic::Ordering::Release)
     }
 
     async fn reset_seqno(&self, seqno: u64) -> Result<()> {

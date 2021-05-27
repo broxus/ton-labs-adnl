@@ -830,6 +830,11 @@ impl AdnlPeers {
     pub fn other(&self) -> &Arc<KeyId> {
         &self.other
     }
+
+    /// Change other peer
+    pub fn set_other(&mut self, other: Arc<KeyId>) {
+        self.other = other;
+    }
 }
 
 #[cfg(feature = "node")]
