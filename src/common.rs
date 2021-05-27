@@ -1,6 +1,7 @@
 use std::convert::TryInto;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::hash::Hash;
+use std::mem::MaybeUninit;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -11,9 +12,9 @@ use ed25519::signature::{Signature, Verifier};
 use rand::Rng;
 use sha2::Digest;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use ton_api::ton::adnl::message::message::{
-    Answer as AdnlAnswerMessage, Custom as AdnlCustomMessage, Query as AdnlQueryMessage,
-};
+use ton_api::ton::adnl::message::message::Answer as AdnlAnswerMessage;
+use ton_api::ton::adnl::message::message::Custom as AdnlCustomMessage;
+use ton_api::ton::adnl::message::message::Query as AdnlQueryMessage;
 use ton_api::ton::adnl::Message as AdnlMessage;
 use ton_api::ton::rldp::message::{Answer as RldpAnswer, Query as RldpQuery};
 use ton_api::ton::{self, TLObject};
@@ -157,41 +158,74 @@ impl AdnlHandshake {
     #[cfg(feature = "node")]
     pub fn parse_packet(
         keys: &dashmap::DashMap<Arc<KeyId>, Arc<KeyOption>>,
-        buffer: &mut Vec<u8>,
+        buffer: &mut PacketView<'_>,
         length: Option<usize>,
     ) -> Result<Option<Arc<KeyId>>> {
-        if buffer.len() < 96 + length.unwrap_or_default() {
-            fail!("Bad handshake packet length: {}", buffer.len());
+        let buffer_len = buffer.get().len();
+        if buffer_len < 96 + length.unwrap_or_default() {
+            fail!("Bad handshake packet length: {}", buffer_len);
         }
 
         let range = match length {
-            Some(length) => 96..96 + length,
-            None => 96..buffer.len(),
+            Some(length) => 96..(96 + length),
+            None => 96..buffer_len,
         };
 
         for key in keys.iter() {
-            if key.value().id().data().eq(&buffer[0..32]) {
+            if key.value().id().data().eq(&buffer.get()[0..32]) {
                 let mut shared_secret = AdnlCryptoUtils::calc_shared_secret(
                     key.value().pvt_key()?,
-                    arrayref::array_ref!(buffer, 32, 32),
+                    arrayref::array_ref!(buffer.get(), 32, 32),
                 );
 
-                Self::build_packet_cipher(&mut shared_secret, arrayref::array_ref!(buffer, 64, 32))
-                    .apply_keystream(&mut buffer[range]);
+                Self::build_packet_cipher(
+                    &mut shared_secret,
+                    arrayref::array_ref!(buffer.get(), 64, 32),
+                )
+                .apply_keystream(&mut buffer.get_mut()[range]);
 
-                if !sha2::Sha256::digest(&buffer[96..])
+                if !sha2::Sha256::digest(&buffer.get()[96..])
                     .as_slice()
-                    .eq(&buffer[64..96])
+                    .eq(&buffer.get()[64..96])
                 {
                     fail!("Bad handshake packet checksum");
                 }
 
-                buffer.drain(0..96);
+                buffer.remove_prefix(96);
                 return Ok(Some(key.key().clone()));
             }
         }
 
         Ok(None)
+    }
+}
+
+pub struct PacketView<'a> {
+    inner: &'a mut [u8],
+}
+
+impl<'a> PacketView<'a> {
+    /// # Safety
+    /// This method is safe to call only for the memory which was initialized
+    pub unsafe fn from_uninit(buffer: &mut [MaybeUninit<u8>]) -> Self {
+        Self {
+            inner: &mut *(buffer as *mut [MaybeUninit<u8>] as *mut [u8]),
+        }
+    }
+
+    pub const fn get(&self) -> &[u8] {
+        self.inner
+    }
+
+    pub fn get_mut(&mut self) -> &mut [u8] {
+        self.inner
+    }
+
+    pub fn remove_prefix(&mut self, prefix_len: usize) {
+        let len = self.inner.len();
+        let ptr = self.inner.as_mut_ptr();
+        // SAFETY: inner is already a reference bounded by a lifetime
+        self.inner = unsafe { std::slice::from_raw_parts_mut(ptr.add(len), len - prefix_len) };
     }
 }
 

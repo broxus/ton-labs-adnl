@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::convert::TryInto;
 use std::mem::MaybeUninit;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{self, AtomicI32, AtomicU32, AtomicU64, AtomicUsize};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -58,6 +58,7 @@ impl AdnlNode {
     const TIMEOUT_SHUTDOWN: u64 = 2000; // Milliseconds
 
     const MAX_ADNL_MESSAGE_SIZE: usize = 1024;
+    const MAX_MESSAGES_IN_PROGRESS: u32 = 512;
     const SIZE_BUFFER: usize = 2048;
 
     pub async fn with_config(mut config: AdnlNodeConfig) -> Result<Arc<Self>> {
@@ -173,7 +174,7 @@ impl AdnlNode {
             }
         });
 
-        let (queue_receive_sender, queue_receive_reader) = mpsc::unbounded_channel();
+        let (queue_receive_sender, mut queue_receive_reader) = mpsc::unbounded_channel();
         let queue_receive_sent = Arc::new(AtomicU64::new(0));
         let queue_receive_read = Arc::new(AtomicU64::new(0));
 
@@ -217,7 +218,168 @@ impl AdnlNode {
             }
         });
 
-        todo!()
+        tokio::spawn({
+            let node = node.clone();
+            let subscribers = subscribers.clone();
+
+            async move {
+                let proc_load = Arc::new(AtomicU32::new(0));
+                loop {
+                    if queue_receive_read.load(atomic::Ordering::Acquire) == 0 {
+                        tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_QUERY_STOP)).await;
+                        continue;
+                    }
+
+                    let current_load = proc_load.load(atomic::Ordering::Acquire);
+                    if current_load > Self::MAX_MESSAGES_IN_PROGRESS {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+
+                    let mut buffer = match queue_receive_reader.recv().await {
+                        Some(buffer) => buffer,
+                        None => break,
+                    };
+
+                    queue_receive_read.fetch_sub(1, atomic::Ordering::Release);
+                    let node = node.clone();
+                    let proc_load = proc_load.clone();
+                    let subscribers = subscribers.clone();
+                    proc_load.fetch_add(1, atomic::Ordering::Release);
+                    tokio::spawn({
+                        async move {
+                            // SAFETY: buffer is guaranteed to be initialized
+                            let buffer_view =
+                                unsafe { PacketView::from_uninit(buffer.as_mut_slice()) };
+
+                            if let Err(e) = node.receive(buffer_view, &subscribers).await {
+                                log::warn!("ERROR <-- {}", e)
+                            }
+                            proc_load.fetch_sub(1, atomic::Ordering::Relaxed);
+                        }
+                    });
+                }
+                node.stop.fetch_add(1, atomic::Ordering::Relaxed);
+                log::warn!("Node socket receiver exited");
+            }
+        });
+
+        tokio::spawn({
+            use std::collections::VecDeque;
+
+            let node = node.clone();
+
+            async move {
+                const PERIOD_NANOS: u64 = 1000000;
+                let start = Instant::now();
+                let mut history = None;
+                while let Some(job) = queue_reader.recv().await {
+                    let (job, stop) = match job {
+                        Job::Send(job) => (job, false),
+                        Job::Stop => (
+                            SendJob {
+                                destination: 0x7F0000010000u64
+                                    | node.config.ip_address.port() as u64,
+                                data: Vec::new(),
+                            },
+                            true,
+                        ),
+                    };
+
+                    if let Some(throughput) = node.config.throughput {
+                        let history = history
+                            .get_or_insert_with(|| VecDeque::with_capacity(throughput as usize));
+                        if history.len() >= throughput as usize {
+                            if let Some(time) = history.pop_front() {
+                                while start.elapsed().as_nanos() - time < (PERIOD_NANOS as u128) {
+                                    tokio::task::yield_now().await;
+                                }
+                            }
+                        }
+                        history.push_back(start.elapsed().as_nanos());
+                    }
+
+                    let addr = SocketAddrV4::new(
+                        Ipv4Addr::from(((job.destination >> 16) as u32).to_be_bytes()),
+                        job.destination as u16,
+                    )
+                    .into();
+
+                    loop {
+                        match socket_send.send_to(job.data.as_slice(), &addr) {
+                            Ok(size) => {
+                                if size != job.data.len() {
+                                    log::error!(
+                                        "Incomplete send: {} bytes of {}",
+                                        size,
+                                        job.data.len()
+                                    )
+                                }
+                            }
+                            Err(e) => match e.kind() {
+                                std::io::ErrorKind::WouldBlock => {
+                                    tokio::task::yield_now().await;
+                                    continue;
+                                }
+                                _ => log::error!("ERROR --> {}", e),
+                            },
+                        }
+                        break;
+                    }
+
+                    if node.stop.load(atomic::Ordering::Acquire) > 0 && stop {
+                        break;
+                    }
+                }
+                node.stop.fetch_add(1, atomic::Ordering::Release);
+                log::warn!("Node socket sender exited");
+            }
+        });
+
+        tokio::spawn({
+            let node = node.clone();
+            let subscribers = subscribers.clone();
+
+            async move {
+                while let Some((message, src)) = queue_local_reader.recv().await {
+                    if node.stop.load(atomic::Ordering::Acquire) > 0 {
+                        break;
+                    }
+                    let query = match message {
+                        AdnlMessage::Adnl_Message_Query(query) => query,
+                        x => {
+                            log::warn!("Unsupported local ADNL message {:?}", x);
+                            continue;
+                        }
+                    };
+
+                    let node = node.clone();
+                    let peers = AdnlPeers::with_keys(src.clone(), src.clone());
+                    let subscribers = subscribers.clone();
+                    tokio::spawn(async move {
+                        let answer = match Self::process_query(&subscribers, &query, &peers).await {
+                            Ok(Some(AdnlMessage::Adnl_Message_Answer(answer))) => answer,
+                            Ok(Some(x)) => {
+                                log::warn!("Unexpected reply {:?}", x);
+                                return;
+                            }
+                            Err(e) => {
+                                log::warn!("ERROR --> {}", e);
+                                return;
+                            }
+                            _ => return,
+                        };
+                        if let Err(e) = node.process_answer(&answer, &src).await {
+                            log::warn!("ERROR --> {}", e);
+                        }
+                    });
+                }
+                node.stop.fetch_add(1, atomic::Ordering::Release);
+                log::warn!("Node loopback exited");
+            }
+        });
+
+        Ok(())
     }
 
     pub async fn stop(&self) {
@@ -650,16 +812,16 @@ impl AdnlNode {
 
     async fn receive(
         &self,
-        buffer: &mut Vec<u8>,
+        mut buffer: PacketView<'_>,
         subscribers: &[Arc<dyn Subscriber>],
     ) -> Result<()> {
         let (local_key, other_key) = if let Some(local_key) =
-            AdnlHandshake::parse_packet(&self.config.keys, buffer, None)?
+            AdnlHandshake::parse_packet(&self.config.keys, &mut buffer, None)?
         {
             (local_key, None)
-        } else if let Some(channel) = self.channels_receive.get(&buffer[0..32]) {
+        } else if let Some(channel) = self.channels_receive.get(&buffer.get()[0..32]) {
             let channel = channel.value();
-            channel.decrypt_inplace(buffer)?;
+            channel.decrypt_inplace(&mut buffer)?;
             if let Some((key, removed)) = self.channels_wait.remove(&channel.other_key) {
                 self.channels_send.insert(key, removed);
             }
@@ -668,12 +830,12 @@ impl AdnlNode {
         } else {
             log::trace!(
                 "Received message to unknown key ID {}",
-                base64::encode(&buffer[0..32])
+                base64::encode(&buffer.get()[0..32])
             );
             return Ok(());
         };
 
-        let packet = deserialize(buffer.as_slice())?
+        let packet = deserialize(buffer.get())?
             .downcast::<AdnlPacketContents>()
             .map_err(|packet| {
                 failure::format_err!("Unsupported ADNL packet format {:?}", packet)
@@ -1063,15 +1225,15 @@ impl AdnlChannel {
         })
     }
 
-    fn decrypt_inplace(&self, buffer: &mut Vec<u8>) -> Result<()> {
-        if buffer.len() < 64 {
-            fail!("Channel message is too short: {}", buffer.len())
+    fn decrypt_inplace(&self, buffer: &mut PacketView) -> Result<()> {
+        if buffer.get().len() < 64 {
+            fail!("Channel message is too short: {}", buffer.get().len())
         }
-        Self::process_data_inplace(buffer, &self.receive_channel.secret);
-        if sha2::Sha256::digest(&buffer[64..]).as_slice() != &buffer[32..64] {
+        Self::process_data_inplace(buffer.get_mut(), &self.receive_channel.secret);
+        if sha2::Sha256::digest(&buffer.get()[64..]).as_slice() != &buffer.get()[32..64] {
             fail!("Bad channel message checksum");
         }
-        buffer.drain(0..64);
+        buffer.remove_prefix(64);
         Ok(())
     }
 
@@ -1090,7 +1252,7 @@ impl AdnlChannel {
         Ok(())
     }
 
-    fn process_data_inplace(buffer: &mut Vec<u8>, secret: &[u8; 32]) {
+    fn process_data_inplace(buffer: &mut [u8], secret: &[u8; 32]) {
         let digest = &buffer[32..64];
         let mut key = crate::from_slice!(secret, 0, 16, digest, 16, 16);
         let mut ctr = crate::from_slice!(digest, 0, 4, secret, 20, 12);
