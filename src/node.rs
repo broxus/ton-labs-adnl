@@ -780,7 +780,7 @@ impl AdnlNode {
     /// Reset peers
     pub fn reset_peers(&self, peers: &AdnlPeers) -> Result<()> {
         let peer_list = self.peers(peers.local())?;
-        let peer = peer_list.get(peers.other()).ok_or_else(|| {
+        let peer_entry = peer_list.get(peers.other()).ok_or_else(|| {
             ton_types::error!(
                 "Try to reset unknown peer pair {} -> {}",
                 peers.local(),
@@ -788,11 +788,19 @@ impl AdnlNode {
             )
         })?;
         log::warn!("Resetting peer pair {} -> {}", peers.local(), peers.other());
-        let peer = peer.value();
+        let peer = peer_entry.value();
         let address = AdnlNodeAddress::from_ip_address_and_key(
             IpAddress(peer.address.ip_address.load(atomic::Ordering::Acquire)),
             peer.address.key.clone(),
         )?;
+
+        let reinit_data = peer
+            .receiver_state
+            .reinit_date
+            .load(atomic::Ordering::Acquire);
+
+        std::mem::drop(peer_entry);
+
         self.channels_wait
             .remove(peers.other())
             .or_else(|| self.channels_send.remove(peers.other()))
@@ -801,15 +809,11 @@ impl AdnlNode {
                     peers.other().clone(),
                     Peer {
                         address,
-                        receiver_state: PeerState::for_receive_with_reinit_date(
-                            peer.receiver_state
-                                .reinit_date
-                                .load(atomic::Ordering::Acquire)
-                                + 1,
-                        ),
+                        receiver_state: PeerState::for_receive_with_reinit_date(reinit_data + 1),
                         sender_state: PeerState::for_send(),
                     },
                 );
+
                 self.channels_receive.remove(removed.receive_id())
             });
         Ok(())
