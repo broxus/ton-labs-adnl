@@ -234,7 +234,8 @@ impl<'a> PacketView<'a> {
         let len = self.inner.len();
         let ptr = self.inner.as_mut_ptr();
         // SAFETY: inner is already a reference bounded by a lifetime
-        self.inner = unsafe { std::slice::from_raw_parts_mut(ptr.add(len), len - prefix_len) };
+        self.inner =
+            unsafe { std::slice::from_raw_parts_mut(ptr.add(prefix_len), len - prefix_len) };
     }
 }
 
